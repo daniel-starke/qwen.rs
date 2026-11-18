@@ -38,6 +38,10 @@ name = "gpubench"
 required-features = ["vulkan"]
 
 [[example]]
+name = "heapprobe"
+required-features = ["vulkan"]
+
+[[example]]
 name = "vramprobe"
 required-features = ["vulkan"]
 

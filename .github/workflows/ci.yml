@@ -14,7 +14,7 @@ jobs:
     # Win32 and Level Zero, and the tests run where they are built.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The GNU host toolchain; `.cargo/config.toml` links with the runner's
       # MinGW-w64 (`x86_64-w64-mingw32-gcc`).
       # Pinned: a newer clippy adds lints that `-D warnings` turns into errors.
@@ -38,7 +38,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pinned: a newer clippy adds lints that `-D warnings` turns into errors.
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -54,7 +54,7 @@ jobs:
           Copy-Item target/deploy/cli.exe, README.md, CHANGELOG, LICENSE $out
           Copy-Item -Recurse docs, profiles $out
           & "$out/cli.exe" --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: qwen.rs-x64
           path: target/package/
