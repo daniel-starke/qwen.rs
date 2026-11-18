@@ -1,0 +1,172 @@
+//! Model-free speculative drafts from the context itself (prompt-lookup /
+//! SuffixDecoding-style, arXiv 2411.04975).
+//!
+//! Agentic and code traffic re-emits text that is already in the context: a
+//! file being edited, a tool call's boilerplate, a test that mirrors the
+//! function above it. When the last few generated tokens occurred earlier, the
+//! tokens that followed them there are a draft that costs **no** forward pass
+//! at all — only the extra verify rows. The verify/accept/rollback path is the
+//! one MTP and DFlash use ([`Model::spec_commit`]), so every emitted token is
+//! still sampled from the main model's own logits.
+//!
+//! The index maps every `GRAM`-token window to the positions that followed it.
+//! A lookup takes the context's last window, extends each earlier occurrence
+//! backwards to find the longest match (most recent wins a tie) and proposes
+//! what followed it.
+
+use std::collections::HashMap;
+
+/// Window the index is keyed on, and the shortest match that drafts.
+pub const GRAM: usize = 3;
+/// Longest match measured backwards; longer ones draft the same.
+const MAX_MATCH: usize = 64;
+/// Earlier occurrences examined per lookup, newest first.
+const MAX_CANDS: usize = 256;
+
+fn key(w: &[u32]) -> u64 {
+    w.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &t| (h ^ t as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// `QWEN_SUFFIX` (default on, `0` disables): draft from the context when no
+/// model drafter applies, and in place of one on a long match.
+pub fn suffix_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| !matches!(std::env::var("QWEN_SUFFIX").as_deref(), Ok("0" | "off" | "no" | "false")))
+}
+
+/// `QWEN_SUFFIX_MIN` (default 12): match length from which a context draft
+/// replaces the MTP / DFlash draft. Below it the model drafter runs.
+pub fn suffix_min_model() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("QWEN_SUFFIX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(12))
+}
+
+/// `QWEN_SUFFIX_ENGINE_MIN` (default 6): the same for an engine that drafts
+/// on its own (the NPU engine's MTP, `server::Engine::verify`). Its verify
+/// step costs the same for any number of drafts and its MTP accepts less
+/// than the GGUF path's: 4 / 6 / 12 = 6.39 / 6.36 / 6.29 tok/s on an
+/// edit-style answer, 5.83 without context drafts (2026-10-10).
+pub fn suffix_min_engine() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("QWEN_SUFFIX_ENGINE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(6).max(GRAM))
+}
+
+/// `QWEN_SUFFIX_PLAIN_MIN` (default `GRAM`): match length from which a context
+/// draft is verified when there is no model drafter.
+pub fn suffix_min_plain() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("QWEN_SUFFIX_PLAIN_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(GRAM).max(GRAM)
+    })
+}
+
+/// Separates documents in a [`SuffixIndex`] built with [`SuffixIndex::push_doc`]:
+/// no window spans it and no draft runs past it.
+const SEP: u32 = u32::MAX;
+
+/// `QWEN_SUFFIX_GLOBAL_TOKENS` (default 1M, 0 disables): tokens of earlier
+/// responses the server keeps for cross-request drafts.
+pub fn suffix_global_cap() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("QWEN_SUFFIX_GLOBAL_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 20)
+    })
+}
+
+/// Token history plus the window index over it.
+#[derive(Default, Clone)]
+pub struct SuffixIndex {
+    toks: Vec<u32>,
+    map: HashMap<u64, Vec<u32>>,
+}
+
+impl SuffixIndex {
+    pub fn new(ctx: &[u32]) -> SuffixIndex {
+        let mut s = SuffixIndex { toks: Vec::with_capacity(ctx.len() + 1024), map: HashMap::new() };
+        for &t in ctx {
+            s.push(t);
+        }
+        s
+    }
+
+    pub fn len(&self) -> usize {
+        self.toks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.toks.is_empty()
+    }
+
+    /// Append one token. The window *ending before* it is indexed now, since
+    /// only then does that window have a continuation to propose.
+    pub fn push(&mut self, t: u32) {
+        let i = self.toks.len();
+        if i >= GRAM && !self.toks[i - GRAM..i].contains(&SEP) {
+            self.map.entry(key(&self.toks[i - GRAM..i])).or_default().push(i as u32);
+        }
+        self.toks.push(t);
+    }
+
+    /// Append a whole document (an earlier response), separated from the
+    /// previous one. Past `cap` tokens the oldest half is dropped.
+    pub fn push_doc(&mut self, doc: &[u32], cap: usize) {
+        if doc.len() < GRAM || cap == 0 {
+            return;
+        }
+        if self.toks.len() + doc.len() + 1 > cap {
+            let keep = self.toks.split_off(self.toks.len() - self.toks.len().min(cap / 2));
+            let start = keep.iter().position(|&t| t == SEP).map_or(keep.len(), |i| i + 1);
+            *self = SuffixIndex::default();
+            for &t in &keep[start..] {
+                self.push(t);
+            }
+        }
+
+## Features
+
+- **GGUF v3 loader** and CPU kernels for Q4_K / Q6_K / Q8_0 / F16 / F32: fused
+  dequant-GEMV for decode, tiled GEMMs on packed q8_K tiles for prefill
+  (~2.3 TFLOP/s Q4_K on AVX2).
+- **CPU + GPU row split** via raw `ash` (Vulkan) and precompiled SPIR-V. Every
+  large matmul keeps a slice of its rows quantized in VRAM, and the GPU computes
+  those rows while the CPU computes the rest — for decode and for prefill. The
+  6 GiB card cannot hold the model, so prefill also streams weights through
+  VRAM, and long prompts run as a two-half pipeline that keeps both devices
+  busy. Integer dot product (dp4a) GEMMs where the device passes a self-check.
+- **NPU engine** through Level Zero, on graphs built by the scripts in
+  `crates/npu/scripts` and compiled with a patched Intel NPU compiler: per-layer
+  int4 graphs whose weights are bound once and shared by prefill and decode,
+  our own SHAVE kernels (`crates/npu/shave`, written in the kernel language of
+  `crates/npu/SHAVE-DSL.md`), a 262144-position context from host-side key
+  blocks, MTP speculative decoding. No OpenVINO at run time.
+- **Hybrid model graph**: full-attention and gated delta-net (SSM) layers,
+  interleaved MRoPE, f16 KV cache, recurrent state, chunked prefill, O(n)
+  generation.
+- **Speculative decoding**, every token still sampled from the main model:
+  - *Context drafts* (default on): copies continuations from earlier text in the
+    conversation — and, on the server, from earlier responses. No draft model;
+    large wins on edits and tool-call boilerplate.
+  - `--mtp [N]`: the model's own multi-token-prediction head (on the NPU: a
+    verify set plus `mtp` in the `.npu` file).
+  - `--dflash <file>`: the separately downloaded DFlash2 block drafter, the
+    fastest option on CPU + GPU.
+- **Vision** (CPU + GPU): the Qwen3-VL tower + projector (`--mmproj`); PNG /
+  JPEG / BMP / Netpbm in, over the API, `--image` on the CLI or `/image` in
+  the chat.
+- **HTTP server** (thread-per-connection HTTP/1.1, hand-written JSON, zero
+  third-party dependencies in the server crate):
+  - Anthropic: `POST /v1/messages` (SSE streaming), `POST /v1/messages/count_tokens`.
+  - OpenAI / llama-server: `POST /v1/chat/completions`, `GET /props`,
+    `GET /v1/models`.
+  - `GET /health`.
+- **Tool use** on both APIs: `tools`, `tool_choice` (enforced structurally),
+  `tool_use` / `tool_result` and `tool_calls` / `tool` messages, streamed
+  arguments. Calls round-trip through the model's own XML-style format, with
+  argument types recovered from each tool's JSON schema.
+- **Prefix cache**: the server keeps each conversation's state, so a follow-up
+  turn prefills only what it adds. Tool preambles and long system prompts are
+  shared across conversations and can be persisted to disk
+  (`--prompt-cache-dir`), so even a new session or a restarted server skips
+  them. The two APIs share the cache.
+- **Multi-turn CLI** (`--interactive`) over one run state.
+

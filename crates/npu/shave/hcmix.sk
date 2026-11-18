@@ -1,0 +1,337 @@
+/* The hyper-connections of Qwen3.8-Flash-Next (`npubuild::flash::graphs`)
+ * on the SHAVEs, two kernels in one, the mode chosen by A's shape.
+ * Carrier: Minimum(A, B) (eltwise_min: multi-cluster and multi-SHAVE
+ * tiling, unused elsewhere in the Flash-Next graphs). The compiler tiles
+ * over the positions (the unique largest dimension) and may merge the
+ * (stream, block) dimensions into 80 rows, so an invocation sees dims
+ * (innermost first) as below, with [20, 4] or [80] for the rows.
+ *
+ * N (A dims [128, 20, 4 | 80, n]): A = the streams x (4 x 20 rows of
+ *   128), B [128, 20, 4 | 80, 1] = the norm weight w:
+ *   y = x / sqrt(mean(x^2) + 1e-6) * w per (position, stream); sums of
+ *   squares in f32.
+ * M (A dims [128, 2, 20, 4 | 80, n]): pair 0 = u (the up matmul before its
+ *   row scale), pair 1 = xn, B [128, 1, 20, 4 | 80, 1] = the row scale su:
+ *   y = 0.25 * sum_s sigmoid(u_s * su_s) * xn_s, written into pair 0 of
+ *   stream 0's rows only (the graph slices them).
+ * G (A dims [128, 96, n] or [128, 2, 48, n]): the delta layer's gated norm
+ *   (`graphs::post`), A = per head the recurrence's output o (pair 0, at
+ *   scale GS) and the gate input z (pair 1), B [128, ...] = the norm weight
+ *   gw (its first 128 values are read, whatever B's shape):
+ *   y = o / sqrt(mean(o^2) + GEPS) * gw * sigmoid(z) per (position, head),
+ *   written into pair 0 (the graph slices it); sums of squares in f32.
+ *   With B per head (dims [128, 96, 1] or [128, 2, 48, 1], `graphs::GN_FOLD`):
+ *   pair 0 = gw times the out-projection's prescale, pair 1 = z's row
+ *   scale zs: y = o / sqrt(mean(o^2) + GEPS) * w_h * sigmoid(z * zs_h).
+ *   The compiler may then merge (128, pair, head) and tile the result:
+ *   A dims [256 nh, n], B [256 nh, 1] (nh heads, a multiple of 4).
+ *   (The 27B's `gnorm.sk` with sigmoid for swish and eps a constant: one
+ *   carrier per graph, and post also holds the HC's mode N.)
+ *
+ *   shave build hcmix.sk eltwise_min_3720xx.elf
+ *
+ * (and the same ELF as eltwise_min_3720xx_lsu0_wo.elf). */
+#define NB 20
+#define NV 16
+#define HS 4
+#define U 4
+const float INVW = 1.0 / 2560;
+/* mode G: heads, and eps = 1e-6 x the output scale GS squared
+   (`npu::flash::OSCALE_P`) */
+#define GH 48
+#ifndef GS
+#define GS 64
+#endif
+const float GEPS = 1e-6 * GS * GS;
+
+void controlled_act(const u32 *params) {
+    /* MemRefData records, 0x24 bytes each: A, B, then the output */
+    const u8 *restrict A = (const u8 *)params[0];
+    const u8 *restrict B = (const u8 *)params[9];
+    u8 *restrict Y = (u8 *)params[18];
+    u32 rank = params[2];
+    const u32 *dims = (const u32 *)params[3];
+    /* strides: i64 in bits, innermost first; word 2k = dimension k's */
+    const u32 *sa = (const u32 *)params[4];
+    const u32 *sb = (const u32 *)params[13];
+    const u32 *sy = (const u32 *)params[22];
+    /* mode G: the heads' dimension merged with the pair (96) or not */
+    u32 gm = 0;
+    if (dims[1] == 2 * GH) gm = 1;
+    if (dims[1] == 2) {
+        if (dims[2] == GH) gm = 2;
+    }
+    /* B per head lets the compiler merge (128, pair, head) into one
+       dimension of 256 per head (and tile it): A dims [256 nh, n] */
+    if (dims[0] != 128) gm = 3;
+    if (gm != 0) {
+        /* bytes from o to z, from a head to the next (A, Y), positions' dimension */
+        u32 zo = sa[2] >> 3;
+        u32 ha = zo << 1;
+        u32 hy = (sy[2] >> 3) << 1;
+        u32 gpd = 2;
+        if (gm == 2) {
+            ha = sa[4] >> 3;
+            hy = sy[4] >> 3;
+            gpd = 3;
+        }
+        if (gm == 3) {
+            zo = 256;
+            ha = 512;
+            hy = 512;
+            gpd = 1;
+        }
+        u32 gnp = 1;
+        const u32 *gdp = dims + gpd;
+        for (u32 d = gpd; d < rank; d++) {
+            gnp *= *gdp;
+            gdp++;
+        }
+        /* B per head: [0] whether, [1] bytes from w to zs, [2] from a head
+           to the next (the stack: registers are short) */
+        u32 gbs[8];
+        const u32 *bd = (const u32 *)params[12];
+        u32 pb = 0;
+        if (bd[1] == 2 * GH) pb = 1;
+        if (bd[1] == 2) {
+            if (bd[2] == GH) pb = 2;
+        }
+        gbs[1] = sb[2] >> 3;
+        gbs[2] = gbs[1] << 1;
+        if (pb == 2) gbs[2] = sb[4] >> 3;
+        /* [3] heads per invocation */
+        gbs[3] = GH;
+        if (gm == 3) {
+            pb = 3;
+            gbs[1] = 256;
+            gbs[2] = 512;
+            gbs[3] = dims[0] >> 8;
+        }
+        gbs[0] = pb;
+        /* [4], [5] the position strides of A, Y; [6] the positions */
+        gbs[4] = (sa + 2 * gpd)[0] >> 3;
+        gbs[5] = (sy + 2 * gpd)[0] >> 3;
+        gbs[6] = gnp;
+        float gss[GH];
+        half grs[GH];
+        for (u32 q = 0; q < gbs[6]; q++) {
+            /* (the constants per position: not live in 3, whose per-head
+               B needs the vector registers) */
+            const float4 gnone = 0.0;
+            const float4 ginvd = 1.0 / 128;
+            const float4 geps = GEPS;
+            const float4 ghalf = 0.5, gthree = 1.5;
+            const int4 gmagic = 0x5f3759df;
+            /* 1: sum of squares of o per head */
+            const u8 *oh = A;
+            float *ss = gss;
+            for (u32 h = 0; h < gbs[3]; h++) {
+                register float4 acc[U];
+                for (int u = 0; u < U; u++) acc[u] = gnone;
+                const half8 *o = (const half8 *)oh;
+                for (int v = 0; v < NV; v++) {
+                    half8 t = o[v];
+                    float4 lo = f16_to_f32(t, 0), hi = f16_to_f32(t, 1);
+                    acc[v % U] += lo * lo;
+                    acc[v % U] += hi * hi;
+                }
+                acc[0] += acc[1];
+                acc[2] += acc[3];
+                acc[0] += acc[2];
+                *ss = sum(acc[0]);
+                ss++;
+                oh += ha;
+            }
+            /* 2: rsqrt(ss / 128 + eps), 4 heads per vector */
+            const float4 *sq = (const float4 *)gss;
+            half *rp = grs;
+            for (u32 h = 0; h < gbs[3]; h += 4) {
+                float4 x4 = *sq * ginvd + geps;
+                float4 r = (float4)(gmagic - ((int4)x4 >> 1));
+                float4 hx = x4 * ghalf;
+#pragma unroll
+                for (int n = 0; n < 3; n++) r = r * (gthree - hx * r * r);
+                for (int j = 0; j < 4; j++) rp[j] = f32_to_f16(r, j);
+                sq++;
+                rp += 4;
+            }
+            /* 3: y = o * rs * gw * sigmoid(z) */
+            const u8 *ob = A;
+            u8 *yb = Y;
+            const half *rq = grs;
+            if (gbs[0] != 0) {
+                const u8 *wb = B;
+                for (u32 h = 0; h < gbs[3]; h++) {
+                    half8 rs = load_splat(rq);
+                    const half8 *o = (const half8 *)ob;
+                    const half8 *z = (const half8 *)(ob + zo);
+                    const half8 *w = (const half8 *)wb;
+                    const half8 *zs = (const half8 *)(wb + gbs[1]);
+                    half8 *y = (half8 *)yb;
+                    for (int v = 0; v < NV; v++) {
+                        half8 zv = z[v] * zs[v];
+                        y[v] = o[v] * rs * w[v] * sigm(zv);
+                    }
+                    rq++;
+                    ob += ha;
+                    yb += hy;
+                    wb += gbs[2];
+                }
+            } else {
+                for (u32 h = 0; h < gbs[3]; h++) {
+                    half8 rs = load_splat(rq);
+                    const half8 *o = (const half8 *)ob;
+                    const half8 *z = (const half8 *)(ob + zo);
+                    const half8 *w = (const half8 *)B;
+                    half8 *y = (half8 *)yb;
+                    for (int v = 0; v < NV; v++) {
+                        half8 zv = z[v];
+                        y[v] = o[v] * rs * w[v] * sigm(zv);
+                    }
+                    rq++;
+                    ob += ha;
+                    yb += hy;
+                }
+            }
+            A += gbs[4];
+            Y += gbs[5];
+        }
+    } else {
+        /* the rows' dimension k (1 + mode), and the positions' one */
+        u32 k = 1;
+        if (dims[1] == 2) k = 2;
+        u32 pd = k + 2;
+        if ((dims + k)[0] == HS * NB) pd = k + 1;
+        u32 npos = 1;
+        const u32 *dp = dims + pd;
+        for (u32 d = pd; d < rank; d++) {
+            npos *= *dp;
+            dp++;
+        }
+        /* per tensor: block stride, stream stride, position stride (bytes);
+           the stack holds them (registers are short) */
+        u32 st[16];
+        const u32 *ka = sa + 2 * k;
+        const u32 *kb = sb + 2 * k;
+        const u32 *ky = sy + 2 * k;
+        st[0] = ka[0] >> 3;
+        st[1] = kb[0] >> 3;
+        st[2] = ky[0] >> 3;
+        if (pd == k + 1) {
+            st[3] = NB * st[0];
+            st[4] = NB * st[1];
+            st[5] = NB * st[2];
+        } else {
+            st[3] = ka[2] >> 3;
+            st[4] = kb[2] >> 3;
+            st[5] = ky[2] >> 3;
+        }
+        const u32 *pa = sa + 2 * pd;
+        const u32 *py = sy + 2 * pd;
+        st[6] = pa[0] >> 3;
+        st[7] = py[0] >> 3;
+        /* from past a stream's last block to the next stream's first */
+        st[8] = st[3] - NB * st[0];
+        st[9] = st[4] - NB * st[1];
+        st[10] = st[5] - NB * st[2];
+        u32 bsa = st[0];
+        u32 bsb = st[1];
+        u32 bsy = st[2];
+        if (k == 1) {
+            /* N */
+            float ssv[4];
+            half rsv[8];
+            const float4 none = 0.0;
+            const float4 invw = INVW;
+            const float4 eps = 1e-6;
+            const float4 halff = 0.5, threehalf = 1.5;
+            const int4 magic = 0x5f3759df;
+            for (u32 q = 0; q < npos; q++) {
+                /* 1: sum of squares per stream */
+                const u8 *as = A;
+                float *ss = ssv;
+                for (u32 s = 0; s < HS; s++) {
+                    register float4 acc[U];
+                    for (int u = 0; u < U; u++) acc[u] = none;
+                    const u8 *ab = as;
+                    for (u32 b = 0; b < NB; b++) {
+                        const half8 *x = (const half8 *)ab;
+                        for (int v = 0; v < NV; v++) {
+                            half8 t = x[v];
+                            float4 lo = f16_to_f32(t, 0), hi = f16_to_f32(t, 1);
+                            acc[v % U] += lo * lo;
+                            acc[v % U] += hi * hi;
+                        }
+                        ab += bsa;
+                    }
+                    acc[0] += acc[1];
+                    acc[2] += acc[3];
+                    acc[0] += acc[2];
+                    *ss = sum(acc[0]);
+                    ss++;
+                    as += st[3];
+                }
+                /* 2: rsqrt(ss / 2560 + eps) of the 4 streams (bit-trick seed + 3 Newton steps) */
+                float4 x4 = *(const float4 *)ssv * invw + eps;
+                float4 r = (float4)(magic - ((int4)x4 >> 1));
+                float4 hx = x4 * halff;
+    #pragma unroll
+                for (int n = 0; n < 3; n++) r = r * (threehalf - hx * r * r);
+                half *rp = rsv;
+                for (int j = 0; j < 4; j++) rp[j] = f32_to_f16(r, j);
+                /* 3: y = x * rs * w */
+                const half8 *x = (const half8 *)A;
+                const half8 *w = (const half8 *)B;
+                half8 *y = (half8 *)Y;
+                const half *rq = rsv;
+                for (u32 s = 0; s < HS; s++) {
+                    half8 rs = load_splat(rq);
+                    for (u32 b = 0; b < NB; b++) {
+                        for (int v = 0; v < NV; v++) y[v] = x[v] * rs * w[v];
+                        x = (const half8 *)((const u8 *)x + bsa);
+                        w = (const half8 *)((const u8 *)w + bsb);
+                        y = (half8 *)((u8 *)y + bsy);
+                    }
+                    rq++;
+                    x = (const half8 *)((const u8 *)x + st[8]);
+                    w = (const half8 *)((const u8 *)w + st[9]);
+                    y = (half8 *)((u8 *)y + st[10]);
+                }
+                A += st[6];
+                Y += st[7];
+            }
+        } else {
+            /* M: pair stride */
+            u32 rsa = sa[2] >> 3;
+            const half8 zero = 0.0;
+            const half8 quarter = 0.25;
+            for (u32 q = 0; q < npos; q++) {
+                const u8 *ab = A;
+                const u8 *bb = B;
+                u8 *yb = Y;
+                for (u32 b = 0; b < NB; b++) {
+                    /* a block as two halves of 8 vectors (registers) */
+                    for (int h = 0; h < 2; h++) {
+                        register half8 acc[8];
+                        for (int v = 0; v < 8; v++) acc[v] = zero;
+                        const half8 *u = (const half8 *)ab;
+                        const half8 *w = (const half8 *)bb;
+                        for (u32 s = 0; s < HS; s++) {
+                            const half8 *x = (const half8 *)((const u8 *)u + rsa);
+                            for (int v = 0; v < 8; v++) acc[v] += sigm(u[8 * h + v] * w[8 * h + v]) * x[8 * h + v];
+                            u = (const half8 *)((const u8 *)u + st[3]);
+                            w = (const half8 *)((const u8 *)w + st[4]);
+                        }
+                        half8 *y = (half8 *)yb;
+                        for (int v = 0; v < 8; v++) y[8 * h + v] = acc[v] * quarter;
+                    }
+                    ab += bsa;
+                    bb += bsb;
+                    yb += bsy;
+                }
+                A += st[6];
+                Y += st[7];
+            }
+        }
+    }
+}

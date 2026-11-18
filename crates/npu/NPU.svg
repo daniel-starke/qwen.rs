@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 510" width="100%" height="100%">
+  <style>
+    .title { font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; fill: #000; }
+    .box-label { font-family: Arial, sans-serif; font-size: 13px; font-weight: bold; fill: #222; text-anchor: middle; }
+    .sub-label { font-family: Arial, sans-serif; font-size: 11px; fill: #333; text-anchor: middle; }
+    .tile-bg { fill: #fff9e6; stroke: #d6b656; stroke-width: 2; rx: 6; ry: 6; }
+    .leonrt-bg { fill: #e1d5e7; stroke: #9673a6; stroke-width: 2; rx: 4; ry: 4; }
+    .leonnn-bg { fill: #e1d5e7; stroke: #9673a6; stroke-width: 1.5; rx: 4; ry: 4; }
+    .dpu-bg { fill: #dae8fc; stroke: #6c8ebf; stroke-width: 1.5; rx: 4; ry: 4; }
+    .shave-bg { fill: #fff2cc; stroke: #d6b656; stroke-width: 1.5; rx: 4; ry: 4; }
+    .vec-bg { fill: #dae8fc; stroke: #6c8ebf; stroke-width: 1; rx: 3; ry: 3; }
+    .sram-bg { fill: #d5e8d4; stroke: #82b366; stroke-width: 1.5; rx: 4; ry: 4; }
+    .dma-bg { fill: #f8cecc; stroke: #b85450; stroke-width: 2; rx: 4; ry: 4; }
+    .sys-bg { fill: #f5f5f5; stroke: #666666; stroke-width: 1.5; rx: 4; ry: 4; }
+  </style>
+
+  <!-- Background -->
+  <rect width="800" height="510" fill="#ffffff" />
+
+  <!-- Title -->
+  <text x="20" y="30" class="title">Intel Core Ultra 285K NPU (NPU 3720 / Arrow Lake-S)</text>
+
+  <!-- LeonRT Microcontroller -->
+  <rect x="20" y="45" width="760" height="30" class="leonrt-bg" />
+  <text x="400" y="65" class="box-label">LeonRT Microcontroller (Firmware &amp; Runtime)</text>
+
+  <!-- Tile 0 -->
+  <g transform="translate(20, 85)">
+    <rect x="0" y="0" width="370" height="310" class="tile-bg" />
+    <text x="185" y="20" class="box-label" style="font-size: 14px;">NCE Tile 0 (Cluster)</text>
+
+    <!-- LeonNN -->
+    <rect x="15" y="30" width="340" height="26" class="leonnn-bg" />
+    <text x="185" y="47" class="box-label" style="font-size: 12px;">LeonNN Microcontroller</text>
+
+    <!-- DPU -->
+    <rect x="15" y="66" width="170" height="204" class="dpu-bg" />
+    <text x="100" y="88" class="box-label" style="font-size: 12px;">DPU (NCE MAC Array)</text>
+    <text x="100" y="122" class="sub-label">Fixed-function CNN Engine</text>
+    <text x="100" y="142" class="sub-label">~10 TOPS INT8 / FP16</text>
+    <text x="100" y="162" class="sub-label">IDU &#8594; MPE &#8594; PPE &#8594; ODU</text>
+
+    <!-- ACT-SHAVE 0 -->
+    <rect x="195" y="66" width="160" height="97" class="shave-bg" />
+    <text x="275" y="84" class="box-label" style="font-size: 12px;">ACT-SHAVE 0</text>
+    <rect x="205" y="94" width="140" height="28" class="vec-bg" />
+    <text x="275" y="112" class="box-label" style="font-size: 11px;">128-bit Vector Unit</text>
+    <text x="275" y="146" class="sub-label">545 M bundles/s</text>
+
+    <!-- ACT-SHAVE 1 -->
+    <rect x="195" y="173" width="160" height="97" class="shave-bg" />
+    <text x="275" y="191" class="box-label" style="font-size: 12px;">ACT-SHAVE 1</text>
+    <rect x="205" y="201" width="140" height="28" class="vec-bg" />
+    <text x="275" y="219" class="box-label" style="font-size: 11px;">128-bit Vector Unit</text>
+    <text x="275" y="253" class="sub-label">545 M bundles/s</text>
+
+    <!-- CMX SRAM -->
+    <rect x="15" y="280" width="340" height="20" class="sram-bg" />
+    <text x="185" y="294" class="box-label" style="font-size: 11px;">2 MB CMX SRAM (Slice 0 @ 0x2E000000)</text>
+  </g>
+
+  <!-- Tile 1 -->
+  <g transform="translate(410, 85)">
+    <rect x="0" y="0" width="370" height="310" class="tile-bg" />
+    <text x="185" y="20" class="box-label" style="font-size: 14px;">NCE Tile 1 (Cluster)</text>
+
+    <!-- LeonNN -->
+    <rect x="15" y="30" width="340" height="26" class="leonnn-bg" />
+    <text x="185" y="47" class="box-label" style="font-size: 12px;">LeonNN Microcontroller</text>
+
+    <!-- DPU -->
+    <rect x="15" y="66" width="170" height="204" class="dpu-bg" />
+    <text x="100" y="88" class="box-label" style="font-size: 12px;">DPU (NCE MAC Array)</text>
+    <text x="100" y="122" class="sub-label">Fixed-function CNN Engine</text>
+    <text x="100" y="142" class="sub-label">~10 TOPS INT8 / FP16</text>
+    <text x="100" y="162" class="sub-label">IDU &#8594; MPE &#8594; PPE &#8594; ODU</text>
+
+    <!-- ACT-SHAVE 2 -->
+    <rect x="195" y="66" width="160" height="97" class="shave-bg" />
+    <text x="275" y="84" class="box-label" style="font-size: 12px;">ACT-SHAVE 2</text>
+    <rect x="205" y="94" width="140" height="28" class="vec-bg" />
+    <text x="275" y="112" class="box-label" style="font-size: 11px;">128-bit Vector Unit</text>
+    <text x="275" y="146" class="sub-label">545 M bundles/s</text>
+
+    <!-- ACT-SHAVE 3 -->
+    <rect x="195" y="173" width="160" height="97" class="shave-bg" />
+    <text x="275" y="191" class="box-label" style="font-size: 12px;">ACT-SHAVE 3</text>
+    <rect x="205" y="201" width="140" height="28" class="vec-bg" />
+    <text x="275" y="219" class="box-label" style="font-size: 11px;">128-bit Vector Unit</text>
+    <text x="275" y="253" class="sub-label">545 M bundles/s</text>
+
+    <!-- CMX SRAM -->
+    <rect x="15" y="280" width="340" height="20" class="sram-bg" />
+    <text x="185" y="294" class="box-label" style="font-size: 11px;">2 MB CMX SRAM (Slice 1 @ 0x2E200000)</text>
+  </g>
+
+  <!-- DMA Engines -->
+  <rect x="20" y="405" width="370" height="26" class="dma-bg" />
+  <text x="205" y="422" class="box-label" style="font-size: 12px;">DMA Engine 0 (~25-27 GB/s)</text>
+
+  <rect x="410" y="405" width="370" height="26" class="dma-bg" />
+  <text x="595" y="422" class="box-label" style="font-size: 12px;">DMA Engine 1 (~25-27 GB/s)</text>
+
+  <!-- Scalable Fabric -->
+  <rect x="20" y="439" width="760" height="24" class="sys-bg" />
+  <text x="400" y="455" class="box-label" style="font-size: 11px;">Arrow Lake Scalable Fabric (~46-50 GB/s Total DMA Bandwidth)</text>
+
+  <!-- Host Memory Controller -->
+  <rect x="20" y="471" width="760" height="24" class="sys-bg" />
+  <text x="400" y="487" class="box-label" style="font-size: 11px;">DDR5-5600 Memory Controller (4400 MT/s Modules: Shared Constants, Buffers, &amp; Scratchpad)</text>
+</svg>

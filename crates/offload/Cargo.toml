@@ -1,0 +1,61 @@
+[package]
+name = "offload"
+description = "Vulkan (ash) GPU offload: row-split matmuls, streamed prefill GEMMs, precompiled SPIR-V kernels."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+quant = { path = "../quant" }
+
+# Vulkan offload path: raw `ash` (Vulkan) running fused dequant+matmul compute
+# shaders precompiled to SPIR-V (see `src/shaders/*.spv`). Weights are uploaded
+# as the ORIGINAL quantized GGUF bytes and dequantized on the fly on the GPU, so
+# they stay compressed in VRAM (the llama.cpp mechanism). No shaderc/glslang/naga
+# runtime dependency: the binary only links the system `vulkan-1` loader at
+# runtime (ash `Entry::load()`), so no Vulkan SDK / import lib is needed to build.
+[dependencies.ash]
+version = "0.38"
+optional = true
+
+[features]
+# Enables the real Vulkan offload path (raw `ash` + fused SPIR-V dequant+matmul
+# kernels). Without it, `OffloadManager` still compiles and `matmul` falls back
+# to the verified CPU `quant::gemm_f16`, so the default build needs no network
+# access and no Vulkan SDK.
+vulkan = ["ash"]
+
+# `gpubench` measures the real Vulkan kernels; without the feature its probe
+# entry points (`alu_probe`, `gemm_probe`) do not exist, so a plain
+# `cargo test --workspace` would fail to build the example rather than skip it.
+[[example]]
+name = "gpubench"
+required-features = ["vulkan"]
+
+[[example]]
+name = "vramprobe"
+required-features = ["vulkan"]
+
+[[example]]
+name = "vramhog"
+required-features = ["vulkan"]
+
+[[example]]
+name = "spvstats"
+required-features = ["vulkan"]
+
+[[example]]
+name = "densebench"
+required-features = ["vulkan"]
+
+[[example]]
+name = "visbench"
+required-features = ["vulkan"]
+
+[lints]
+workspace = true

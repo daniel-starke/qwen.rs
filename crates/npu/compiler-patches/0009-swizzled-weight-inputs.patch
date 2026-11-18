@@ -1,0 +1,259 @@
+diff --git a/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/resolve_dma_with_swizzling.cpp b/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/resolve_dma_with_swizzling.cpp
+index fd00944fb..78afdeb2d 100644
+--- a/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/resolve_dma_with_swizzling.cpp
++++ b/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/resolve_dma_with_swizzling.cpp
+@@ -12,6 +12,11 @@
+ #include "vpux/compiler/dialect/const/ops.hpp"
+ #include "vpux/compiler/utils/rewriter.hpp"
+ #include "vpux/compiler/utils/swizzling_utils.hpp"
++#include "vpux/compiler/dialect/config/IR/utils.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <map>
+ 
+ namespace vpux::VPUIP {
+ #define GEN_PASS_DECL_RESOLVEDMAWITHSWIZZLING
+@@ -52,6 +57,7 @@ void createNewFlatAlignedConst(Const::DeclareOp& constOp) {
+ 
+ void ResolveDMAWithSwizzlingPass::safeRunOnFunc() {
+     auto func = getOperation();
++    std::map<int64_t, int> rsInputState;  // network input -> 1 swizzled, 2 plain
+ 
+     func->walk([&](VPURT::TaskOp taskOp) {
+         if (taskOp.getExecutorKind() != VPU::ExecutorKind::DMA_NN) {
+@@ -76,6 +82,31 @@ void ResolveDMAWithSwizzlingPass::safeRunOnFunc() {
+         auto inputSwizzling = getSwizzlingKey(inputBuffType);
+         auto outputSwizzling = getSwizzlingKey(outputBuffType);
+ 
++        if (std::getenv("NPU_RS_SWZIN") != nullptr) {
++            // qwen.rs: a graph input is read either only by copies into
++            // swizzled CMX buffers (the host supplies it swizzled, see
++            // swizzling.cpp) or only plainly; each swizzled copy must start
++            // at a multiple of the swizzle period (512 << key bytes) and be
++            // 512-aligned. NPU_RS_SWZIN_LOG=FILE lists the swizzled inputs.
++            auto src = dmaOp.getInput().getDefiningOp<VPURT::DeclareBufferOp>();
++            if (src != nullptr && src.getSection() == VPURT::BufferSection::NetworkInput) {
++                const auto idx = src.getSectionIndex().has_value() ? parseIntArrayAttr<int64_t>(src.getSectionIndex().value()).front() : -1;
++                const bool swz = inputSwizzling == 0 && outputSwizzling != 0;
++                auto& state = rsInputState[idx];
++                VPUX_THROW_WHEN(state != 0 && state != (swz ? 1 : 2),
++                                "NPU_RS_SWZIN: network input {0} is read both swizzled and plain, task - '{1}'", idx, taskOp);
++                state = swz ? 1 : 2;
++                if (swz) {
++                    const auto inSize =
++                            Byte(inputBuffType.getMemStrides().front() * inputBuffType.getMemShape().front()).count();
++                    const auto off = src.getByteOffset();
++                    VPUX_THROW_WHEN(inSize % 512 != 0 || off % (int64_t(512) << outputSwizzling) != 0,
++                                    "NPU_RS_SWZIN: swizzled copy of input {0} at {1}, {2} bytes: not period / 512 aligned",
++                                    idx, off, inSize);
++                    return;
++                }
++            }
++        }
+         VPUX_THROW_WHEN(inputSwizzling != outputSwizzling, "Incompatible swizzling setting on task - '{0}'", taskOp);
+ 
+         if (inputSwizzling == 0) {
+@@ -201,6 +232,16 @@ void ResolveDMAWithSwizzlingPass::safeRunOnFunc() {
+             outputBuff->erase();
+         }
+     });
++    if (const char* logPath = std::getenv("NPU_RS_SWZIN_LOG")) {
++        if (FILE* f = std::fopen(logPath, "w")) {
++            for (const auto& [idx, st] : rsInputState) {
++                if (st == 1) {
++                    std::fprintf(f, "%lld\n", static_cast<long long>(idx));
++                }
++            }
++            std::fclose(f);
++        }
++    }
+ }
+ 
+ }  // namespace
+diff --git a/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/swizzling.cpp b/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/swizzling.cpp
+index beebcf8c6..90f66bca6 100644
+--- a/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/swizzling.cpp
++++ b/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/swizzling.cpp
+@@ -21,9 +21,13 @@
+ #include "vpux/compiler/utils/swizzling_utils.hpp"
+ #include "vpux/compiler/utils/types.hpp"
+ 
++#include <mlir/Dialect/Func/IR/FuncOps.h>
+ #include <mlir/IR/IRMapping.h>
++#include <mlir/Interfaces/ViewLikeInterface.h>
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace vpux::VPUIP {
+ #define GEN_PASS_DECL_SWIZZLING
+@@ -35,6 +39,69 @@ using namespace vpux;
+ 
+ namespace {
+ 
++// qwen.rs: `NPU_RS_SWZIN=1` swizzles NCE weights that are copied into CMX
++// from a DDR graph input (quantized, compact copies only) instead of a
++// constant. The host must supply the input's bytes already swizzled, with
++// the period starting at the input's first byte (each copied tile must then
++// start at a multiple of the period: checked in ResolveDMAWithSwizzling); the
++// compiler only marks the CMX buffer and leaves the data alone.
++// `NPU_RS_SWZKEY=K` (1..5): the swizzle key of weights (default 5, the
++// compiler's own); a smaller key repeats every 512 << K bytes, so tiles that
++// start at such offsets can share one pre-swizzled input.
++int64_t rsWeightKey() {
++    static const int64_t key = [] {
++        const char* e = std::getenv("NPU_RS_SWZKEY");
++        const int64_t k = e != nullptr ? std::atoi(e) : 5;
++        return k >= 1 && k <= 5 ? k : int64_t(5);
++    }();
++    return key;
++}
++
++bool rsSwizzleInputs() {
++    static const bool on = [] {
++        const char* e = std::getenv("NPU_RS_SWZIN");
++        return e != nullptr && e[0] == '1';
++    }();
++    return on;
++}
++
++// A graph input: `v` reached through view ops from an argument of a public
++// (entry) function -- never a computed tensor. An argument of a private
++// (outlined) function counts when every call site passes a graph input.
++bool rsIsGraphInput(mlir::Value v, int depth = 0) {
++    while (auto* op = v.getDefiningOp()) {
++        auto view = mlir::dyn_cast<mlir::ViewLikeOpInterface>(op);
++        if (view == nullptr) {
++            return false;
++        }
++        v = view.getViewSource();
++    }
++    auto arg = mlir::dyn_cast<mlir::BlockArgument>(v);
++    if (arg == nullptr) {
++        return false;
++    }
++    auto func = mlir::dyn_cast_or_null<mlir::func::FuncOp>(arg.getOwner()->getParentOp());
++    if (func == nullptr) {
++        return false;
++    }
++    if (!func.isPrivate()) {
++        return true;
++    }
++    auto module = func->getParentOfType<mlir::ModuleOp>();
++    auto uses = mlir::SymbolTable::getSymbolUses(func, module);
++    if (depth > 4 || module == nullptr || !uses.has_value() || uses->empty()) {
++        return false;
++    }
++    for (const auto& use : *uses) {
++        auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getUser());
++        if (call == nullptr || arg.getArgNumber() >= call.getNumOperands() ||
++            !rsIsGraphInput(call.getOperand(arg.getArgNumber()), depth + 1)) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ //
+ // Swizzling
+ //
+@@ -314,14 +381,19 @@ bool Swizzling::canSwizzleWeights(VPUIP::NCEClusterTaskOp nceOp, DeviceInfo& dev
+             return false;
+         }
+     } else if (isTiled) {
+-        auto checkDistributedContent = [&](mlir::Value value) {
++        auto checkDistributedContent = [&](mlir::Value value, bool allowInput = false) {
+             auto copyOp = value.getDefiningOp<VPUIP::CopyOp>();
+             if (copyOp == nullptr) {
+                 return false;
+             }
+             auto decOp = copyOp.getInput().getDefiningOp<Const::DeclareOp>();
+             if (decOp == nullptr) {
+-                return false;
++                return allowInput && rsSwizzleInputs() && rsIsGraphInput(copyOp.getInput()) &&
++                       mlir::isa<mlir::quant::QuantizedType>(
++                               mlir::cast<NDTypeInterface>(copyOp.getInput().getType()).getElementType()) &&
++                       mlir::cast<NDTypeInterface>(copyOp.getInput().getType()).getTotalAllocSize() ==
++                               mlir::cast<NDTypeInterface>(copyOp.getInput().getType()).getCompactAllocSize() &&
++                       copyOp.getOutputBuff().getDefiningOp<VPURT::AllocDistributed>() != nullptr;
+             }
+             auto distributedBufferOp = copyOp.getOutputBuff().getDefiningOp<VPURT::AllocDistributed>();
+             if (distributedBufferOp == nullptr) {
+@@ -338,7 +410,7 @@ bool Swizzling::canSwizzleWeights(VPUIP::NCEClusterTaskOp nceOp, DeviceInfo& dev
+ 
+         auto bufferTilingOp = shapeCastOp ? shapeCastOp.getSource() : weights;
+ 
+-        if (!checkDistributedContent(bufferTilingOp)) {
++        if (!checkDistributedContent(bufferTilingOp, /*allowInput=*/true)) {
+             _log.nest().trace("Cannot swizzle weights, because weights do not satisfy distributed type requirements");
+             return false;
+         }
+@@ -357,14 +429,19 @@ bool Swizzling::canSwizzleWeights(VPUIP::NCEClusterTaskOp nceOp, DeviceInfo& dev
+             }
+         }
+     } else {
+-        auto checkCopyOfContentForSwizzling = [&](VPUIP::CopyOp copyOp) {
++        auto checkCopyOfContentForSwizzling = [&](VPUIP::CopyOp copyOp, bool allowInput = false) {
+             if (copyOp == nullptr) {
+                 return false;
+             }
+ 
+             auto decOp = copyOp.getInput().getDefiningOp<Const::DeclareOp>();
+             if (decOp == nullptr) {
+-                return false;
++                return allowInput && rsSwizzleInputs() && rsIsGraphInput(copyOp.getInput()) &&
++                       mlir::isa<mlir::quant::QuantizedType>(
++                               mlir::cast<NDTypeInterface>(copyOp.getInput().getType()).getElementType()) &&
++                       mlir::cast<NDTypeInterface>(copyOp.getInput().getType()).getTotalAllocSize() ==
++                               mlir::cast<NDTypeInterface>(copyOp.getInput().getType()).getCompactAllocSize() &&
++                       copyOp.getOutputBuff().getDefiningOp<mlir::memref::AllocOp>() != nullptr;
+             }
+ 
+             if (_checkConstantSizeAlignment && isSizeAlignmentRequired(decOp, deviceInfo.archKind)) {
+@@ -374,7 +451,7 @@ bool Swizzling::canSwizzleWeights(VPUIP::NCEClusterTaskOp nceOp, DeviceInfo& dev
+         };
+ 
+         auto copyOp = weights.getDefiningOp<VPUIP::CopyOp>();
+-        if (!checkCopyOfContentForSwizzling(copyOp)) {
++        if (!checkCopyOfContentForSwizzling(copyOp, /*allowInput=*/true)) {
+             _log.nest().trace("Cannot swizzle weights, because weights do not satisfy distributed type requirements");
+             return false;
+         }
+@@ -476,11 +553,11 @@ void Swizzling::constantBufferSwizzling(mlir::OpBuilder& builder, VPUIP::NCEClus
+ 
+     auto isTiled = mlir::dyn_cast<vpux::VPUIP::DistributedBufferType>(nceOp->getResult(0).getType()) != nullptr;
+     auto isFused = nceOp->hasAttr(vpux::ConstantFusing::constantsFused);
+-    auto swizzlingSchemeAttr = createSwizzlingSchemeAttr(&getContext(), deviceInfo.archKind, SWIZZLING_KEY_5);
++    auto swizzlingSchemeAttr = createSwizzlingSchemeAttr(&getContext(), deviceInfo.archKind, rsWeightKey());
+ 
+     auto shapeCastOp = cst.getDefiningOp<VPUIP::ShapeCastOp>();
+     if (isFused || shapeCastOp) {
+-        adjustReturnTypesForInputChain(cst, SWIZZLING_KEY_5, deviceInfo.archKind);
++        adjustReturnTypesForInputChain(cst, rsWeightKey(), deviceInfo.archKind);
+     }
+ 
+     VPUIP::CopyOp copyOp;
+@@ -508,7 +585,9 @@ void Swizzling::constantBufferSwizzling(mlir::OpBuilder& builder, VPUIP::NCEClus
+ 
+         _log.trace("Enable swizzling for distributed constant buffer of NCE task - '{0}'", nceOp->getLoc());
+ 
+-        updateConstantTypeForSwizzling(decOp, copyOp, SWIZZLING_KEY_5, deviceInfo);
++        if (decOp != nullptr || !rsSwizzleInputs()) {
++            updateConstantTypeForSwizzling(decOp, copyOp, rsWeightKey(), deviceInfo);
++        }
+ 
+         auto origType = mlir::cast<vpux::VPUIP::DistributedBufferType>(distributedBuffer.getType());
+ 
+@@ -525,7 +604,9 @@ void Swizzling::constantBufferSwizzling(mlir::OpBuilder& builder, VPUIP::NCEClus
+ 
+         _log.trace("Enable swizzling for constant buffer of NCE task - '{0}'", nceOp->getLoc());
+ 
+-        updateConstantTypeForSwizzling(decOp, copyOp.getOperation(), SWIZZLING_KEY_5, deviceInfo);
++        if (decOp != nullptr || !rsSwizzleInputs()) {
++            updateConstantTypeForSwizzling(decOp, copyOp.getOperation(), rsWeightKey(), deviceInfo);
++        }
+ 
+         auto origType = mlir::cast<vpux::NDTypeInterface>(allocOp.getType());
+         newType = getMemRefType(origType.getShape(), origType.getElementType(), origType.getDimsOrder(),

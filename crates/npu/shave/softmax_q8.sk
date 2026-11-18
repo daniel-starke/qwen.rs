@@ -1,0 +1,125 @@
+/* Softmax of a far attention block with 8-bit probabilities: per row of N
+ * f16 scores (the last two slots are not keys)
+ *   out[k] = c[k], u8, with c / 255 ~ exp(x[k] - max(x)) for k < N - 2
+ *   out[N-2 .. N] = max(x), f16
+ * so that P V runs as the DPU's integer FC (u8 x int8). Before it is rounded
+ * every value gets one of 64 offsets within half a code (an ordered dither:
+ * slot k that of k mod 64). Plain rounding drops every key below 1 / 510 of
+ * the top one, a flat background over a thousand keys with it; dithered, the
+ * codes are right on average. Carrying each code's error into the next one
+ * (error diffusion) measured no better on P V and costs a fourth VAU
+ * operation per vector. The value rows of the two slots are zero, so the
+ * bytes of max add nothing to P V; the host gets sum(c) from a row of ones
+ * in V.
+ *
+ * Carrier: Greater (f16, f16 -> boolean), whose output the next graph reads
+ * as u8; records: x, the other operand (unused), out.
+ *
+ *   shave build softmax_q8.sk eltwise_greater_3720xx.elf -DN=1024
+ */
+#ifndef N
+#define N 1024
+#endif
+/* the output's record (0x24 bytes each: 18 = the third) */
+#ifndef OUT
+#define OUT 18
+#endif
+/* vectors per round: of the maximum's pass, of the exp pass */
+#ifndef UM
+#define UM 16
+#endif
+#ifndef U
+#define U 8
+#endif
+const u32 NVEC = N / 8;
+const u32 MROUNDS = NVEC / UM;
+const u32 ROUNDS = NVEC / U;
+_Static_assert(N % (8 * UM) == 0 && MROUNDS >= 3, "N / 8 / UM must be a whole number >= 3");
+_Static_assert(N % (8 * U) == 0 && ROUNDS >= 3, "N / 8 / U must be a whole number >= 3");
+
+void controlled_act(const u32 *params) {
+    const half8 *restrict x = (const half8 *)params[0];
+    u32 rank = params[2];
+    const u32 *dims = (const u32 *)params[3];
+    u8 *restrict y = (u8 *)params[OUT];
+    u32 n = 1;
+    do {
+        n *= *dims;
+        dims++;
+        rank--;
+    } while (rank != 0);
+    const half8 *end = (const half8 *)((const half *)x + n);
+    const half8 low = -65504.0;
+    /* the offsets, in codes / 255: lane l of vector u has (8 L[l] + u + 0.5) / 64 - 0.5, L = 0 4 2 6 1 5 3 7 */
+    half8 dl = (0.5 / 64.0 - 0.5) / 255.0, k;
+    k = (32.5 / 64.0 - 0.5) / 255.0;
+    dl = align(dl, k, 2);
+    k = (16.5 / 64.0 - 0.5) / 255.0;
+    dl = align(dl, k, 2);
+    k = (48.5 / 64.0 - 0.5) / 255.0;
+    dl = align(dl, k, 2);
+    k = (8.5 / 64.0 - 0.5) / 255.0;
+    dl = align(dl, k, 2);
+    k = (40.5 / 64.0 - 0.5) / 255.0;
+    dl = align(dl, k, 2);
+    k = (24.5 / 64.0 - 0.5) / 255.0;
+    dl = align(dl, k, 2);
+    k = (56.5 / 64.0 - 0.5) / 255.0;
+    dl = align(dl, k, 2);
+    barrier();
+    do {
+        /* 1: the maximum, UM vectors per round */
+        register half8 m[UM];
+        half8 last;
+        const half8 *p = x;
+        for (int u = 0; u < UM; u++) m[u] = p[u];
+        p += UM;
+        for (u32 r = 0; r < MROUNDS - 2; r++) {
+            for (int u = 0; u < UM; u++) m[u] = max(m[u], p[u]);
+            p += UM;
+        }
+        for (int u = 0; u < UM - 1; u++) m[u] = max(m[u], p[u]);
+        /* the row's last vector with the two slots at the lowest value */
+        last = align(rot(p[UM - 1], 12), low, 4);
+        m[UM - 1] = max(m[UM - 1], last);
+        for (int s = 1; s < UM; s *= 2)
+            for (int u = 0; u + s < UM; u += 2 * s) m[u] = max(m[u], m[u + s]);
+        /* every lane = the maximum of the 8 */
+        half8 mv = max(m[0], rot(m[0], 8));
+        mv = max(mv, rot(mv, 4));
+        mv = max(mv, rot(mv, 2));
+        barrier();
+
+        /* 2: c = exp(x - max) + the slot's offset, as a u8 fraction (the
+         * offsets of the 8 vectors made here: the first pass needs the registers) */
+        register half8 d[U];
+        half8 step = 8.0 / U / 64.0 / 255.0;
+        d[0] = dl;
+        for (int u = 1; u < U; u++) d[u] = d[u - 1] + step;
+        /* a round converts and stores the round before while its own
+         * loads and exp are on their way */
+        register half8 t[U];
+        u8 *q = y;
+        p = x;
+        for (int u = 0; u < U; u++) t[u] = exp(p[u] - mv) + d[u];
+        p += U;
+        for (u32 r = 0; r < ROUNDS - 2; r++) {
+            for (int u = 0; u < U; u++) {
+                q[8 * u] = f16_to_u8f(t[u]);
+                t[u] = exp(p[u] - mv) + d[u];
+            }
+            p += U;
+            q += 8 * U;
+        }
+        for (int u = 0; u < U; u++) {
+            q[8 * u] = f16_to_u8f(t[u]);
+            if (u < U - 1) t[u] = exp(p[u] - mv) + d[u];
+            else t[u] = exp(last - mv) + d[u];
+        }
+        q += 8 * U;
+        for (int u = 0; u < U; u++) q[8 * u] = f16_to_u8f(t[u]);
+        ((half *)y)[N / 2 - 1] = mv[0];
+        x += NVEC;
+        y += N;
+    } while (x != end);
+}

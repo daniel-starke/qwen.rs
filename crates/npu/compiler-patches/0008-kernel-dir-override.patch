@@ -1,0 +1,39 @@
+diff --git a/src/vpux_compiler/src/act-kernels/shave_binary_resources.cpp b/src/vpux_compiler/src/act-kernels/shave_binary_resources.cpp
+index 0b59e209f..c48a583bc 100644
+--- a/src/vpux_compiler/src/act-kernels/shave_binary_resources.cpp
++++ b/src/vpux_compiler/src/act-kernels/shave_binary_resources.cpp
+@@ -7,6 +7,9 @@
+ #include "vpux/compiler/dialect/config/IR/utils.hpp"
+ 
+ #include <cstdint>
++#include <cstdlib>
++#include <iterator>
++#include <vector>
+ #include <fstream>
+ #include <memory>
+ #include <string>
+@@ -35,6 +38,24 @@ vpux::SmallString ShaveBinaryResources::getSwKernelArchString(config::ArchKind a
+ }
+ 
+ llvm::ArrayRef<uint8_t> ShaveBinaryResources::getElf(llvm::StringRef kernelPath) const {
++    // qwen.rs (NPU_RS_KERNEL_DIR=DIR): DIR/<kernelPath>.elf (e.g. inverse_3720xx.elf,
++    // inverse_3720xx_lsu0_wo.elf) replaces the embedded kernel of that name
++    if (const char* dir = std::getenv("NPU_RS_KERNEL_DIR"); dir != nullptr && *dir != 0) {
++        static std::unordered_map<std::string, std::vector<uint8_t>> overrides;
++        const auto key = kernelPath.str();
++        auto it = overrides.find(key);
++        if (it == overrides.end()) {
++            std::vector<uint8_t> data;
++            std::ifstream f(std::string(dir) + "/" + key + ".elf", std::ios::binary);
++            if (f.is_open()) {
++                data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
++            }
++            it = overrides.emplace(key, std::move(data)).first;
++        }
++        if (!it->second.empty()) {
++            return llvm::ArrayRef<uint8_t>(it->second.data(), it->second.size());
++        }
++    }
+     auto symbolName = printToString("{0}_elf", kernelPath);
+     const auto it = shaveBinaryResourcesMap.find(symbolName);
+ 

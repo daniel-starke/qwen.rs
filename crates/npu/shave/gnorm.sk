@@ -1,0 +1,135 @@
+/* Gated RMSNorm of the delta layer (`build_delta.py --gnk`):
+ *   y = o / sqrt(mean(o^2) + eps) * gw * z * sigmoid(z), per (position, head).
+ * Carrier: Minimum(A, B) (eltwise_min: multi-cluster and multi-SHAVE tiling,
+ * unused elsewhere in a delta layer). A = [1, S, H, 2, D] with rows
+ * (h, 0) = o_h, (h, 1) = z_h; B = [1, 1, H, 2, D] with rows (h, 0) = gw_h and
+ * eps (f32) in the first two halves of row (0, 1). The compiler tiles over S,
+ * so an invocation sees dims (innermost first) [D, 2H, n, ...] with every row
+ * whole; only rows (h, 0) of the output are written (the graph slices them).
+ *
+ * The SHAVE flushes f16 subnormal inputs to zero (VAU and the f16 -> f32
+ * conversion alike), so o must arrive scaled up: `--qs 16` (at q scale 1 47 %
+ * of o is subnormal and whole rows normalize from zero).
+ *
+ *   shave build gnorm.sk eltwise_min_3720xx.elf
+ *
+ * (and the same ELF as eltwise_min_3720xx_lsu0_wo.elf). */
+#ifndef D
+#define D 128
+#endif
+#define NV (D / 8)
+/* heads per invocation at most (the stack arrays) */
+#define HMAX 64
+/* chains in the sum of squares */
+#ifndef U
+#define U 4
+#endif
+/* vectors per block of it */
+#ifndef U1
+#define U1 16
+#endif
+/* vectors per round of the output pass */
+#ifndef U3
+#define U3 16
+#endif
+_Static_assert(D % (8 * U) == 0 && D % (8 * U3) == 0 && (U & (U - 1)) == 0, "D / 8 must be a multiple of U (a power of 2) and of U3");
+
+void controlled_act(const u32 *params) {
+    /* MemRefData records, 0x24 bytes each: A, B, then the output */
+    const u8 *restrict A = (const u8 *)params[0];
+    const u8 *restrict B = (const u8 *)params[9];
+    u8 *restrict Y = (u8 *)params[18];
+    u32 rank = params[2];
+    const u32 *dims = (const u32 *)params[3];
+    u32 H = dims[1] >> 1;
+    u32 npos = 1;
+    const u32 *dp = dims + 2;
+    for (u32 d = 2; d < rank; d++) {
+        npos *= *dp;
+        dp++;
+    }
+    /* (4 slots in front: the first round of pass 1 stores a sum of nothing) */
+    float ssv[HMAX + 4];
+    half rsv[HMAX];
+    for (u32 q = 0; q < npos; q++) {
+        /* strides are i64, in bits: word 2 a row's, word 4 a position's; >> 2 = bytes
+           from a head to the next (two rows) */
+        /* 1: sum of squares per head, f32 */
+        const u8 *oh = A;
+        u32 sh = ((const u32 *)params[4])[2] >> 2;
+        float *ss = ssv + 3;
+        register float4 acc[U];
+        const float4 none = 0.0;
+        for (int u = 0; u < U; u++) acc[u] = none;
+        for (u32 h = 0; h < H; h++) {
+            /* the head before: its sum, while this head's vectors are on their way */
+            for (int s = 1; s < U; s *= 2)
+                for (int u = 0; u + s < U; u += 2 * s) acc[u] += acc[u + s];
+            *ss = sum(acc[0]);
+            ss++;
+            const half8 *o = (const half8 *)oh;
+            for (int v = 0; v < NV; v++) {
+                /* (all at once: more loaded vectors waiting than there are registers) */
+                if (v % U1 == 0 && v > 0) barrier();
+                half8 x = o[v];
+                float4 lo = f16_to_f32(x, 0), hi = f16_to_f32(x, 1);
+                if (v < U) acc[v] = lo * lo;
+                else acc[v % U] += lo * lo;
+                acc[v % U] += hi * hi;
+            }
+            oh += sh;
+        }
+        for (int s = 1; s < U; s *= 2)
+            for (int u = 0; u + s < U; u += 2 * s) acc[u] += acc[u + s];
+        *ss = sum(acc[0]);
+        /* 2: rsqrt(ss / D + eps), 4 heads per vector (bit-trick seed + 3 Newton steps) */
+        const float4 eps = splat(((const float *)(B + (((const u32 *)params[13])[2] >> 3)))[0]);
+        const float4 halff = 0.5, threehalf = 1.5;
+        _Static_assert(D == 64 || D == 128 || D == 256, "D is 64, 128 or 256");
+        const float4 invd = 1.0 / D;
+        const int4 magic = 0x5f3759df;
+        const float4 *sq = (const float4 *)(ssv + 4);
+        half *rp = rsv;
+        for (u32 h = 0; h < H; h += 4) {
+            float4 x = *sq * invd + eps;
+            float4 y = (float4)(magic - ((int4)x >> 1));
+            float4 hx = x * halff;
+#pragma unroll
+            for (int n = 0; n < 3; n++) y = y * (threehalf - hx * y * y);
+            for (int k = 0; k < 4; k++) rp[k] = f32_to_f16(y, k);
+            sq++;
+            rp += 4;
+        }
+        /* 3: y = o * rs * gw * z * sigmoid(z); the pointers run along a row, then
+           skip to the next head's */
+        u32 row = ((const u32 *)params[4])[2] >> 3;
+        const half8 *o = (const half8 *)A;
+        const half8 *z = (const half8 *)(A + row);
+        const half8 *g = (const half8 *)B;
+        half8 *y = (half8 *)Y;
+        const half *rq = rsv;
+        u32 osk = (row << 1) - 2 * D;
+        u32 gsk = (((const u32 *)params[13])[2] >> 2) - 2 * D;
+        u32 ysk = (((const u32 *)params[22])[2] >> 2) - 2 * D;
+        for (u32 h = 0; h < H; h++) {
+            half8 rs = load_splat(rq);
+            for (u32 r = 0; r < NV / U3; r++) {
+                for (int k = 0; k < U3; k++) {
+                    half8 zv = z[k];
+                    y[k] = o[k] * rs * g[k] * zv * sigm(zv);
+                }
+                o += U3;
+                z += U3;
+                g += U3;
+                y += U3;
+            }
+            rq++;
+            o = (const half8 *)((const u8 *)o + osk);
+            z = (const half8 *)((const u8 *)z + osk);
+            g = (const half8 *)((const u8 *)g + gsk);
+            y = (half8 *)((u8 *)y + ysk);
+        }
+        A += ((const u32 *)params[4])[4] >> 3;
+        Y += ((const u32 *)params[22])[4] >> 3;
+    }
+}

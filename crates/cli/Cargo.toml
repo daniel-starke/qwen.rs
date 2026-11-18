@@ -1,0 +1,32 @@
+[package]
+name = "cli"
+description = "Command line of qwen.rs: generation, interactive chat, the HTTP server and the NPU build."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+quant = { path = "../quant" }
+model = { path = "../model" }
+tokenizer = { path = "../tokenizer" }
+sampler = { path = "../sampler" }
+server = { path = "../server" }
+imgio = { path = "../imgio" }
+vision = { path = "../vision" }
+ov = { path = "../ov" }
+npu = { path = "../npu" }
+npubuild = { path = "../npubuild" }
+imagegen = { path = "../imagegen" }
+offload = { path = "../offload" }
+
+[features]
+vulkan = ["model/vulkan", "server/vulkan", "vision/vulkan", "offload/vulkan", "npubuild/vulkan", "imagegen/vulkan"]
+
+[lints]
+workspace = true

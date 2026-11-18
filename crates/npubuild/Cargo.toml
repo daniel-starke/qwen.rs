@@ -1,0 +1,31 @@
+[package]
+name = "npubuild"
+description = "Builds the NPU engine's weights and graph sets from the BF16 checkpoint."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+# Builds every file the NPU engine (`cli MODEL.npu`) needs from the BF16
+# checkpoint: calibration on a float reference forward, GPTQ int4 weights,
+# the OpenVINO-format layer graphs, their compilation and the graph sets.
+[dependencies]
+quant = { path = "../quant" }
+npu = { path = "../npu" }
+ov = { path = "../ov" }
+offload = { path = "../offload" }
+tokenizer = { path = "../tokenizer" }
+vision = { path = "../vision" }
+
+[dev-dependencies]
+imgio = { path = "../imgio" }
+
+[features]
+vulkan = ["offload/vulkan", "vision/vulkan"]
+
+[lints]
+workspace = true

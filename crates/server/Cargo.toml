@@ -1,0 +1,28 @@
+[package]
+name = "server"
+description = "HTTP/1.1 server for the Anthropic Messages and OpenAI Chat Completions APIs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+model = { path = "../model" }
+quant = { path = "../quant" }
+tokenizer = { path = "../tokenizer" }
+sampler = { path = "../sampler" }
+imgio = { path = "../imgio" }
+vision = { path = "../vision" }
+prefixcache = { path = "../prefixcache" }
+imagegen = { path = "../imagegen" }
+
+[features]
+vulkan = ["model/vulkan", "vision/vulkan"]
+
+[lints]
+workspace = true

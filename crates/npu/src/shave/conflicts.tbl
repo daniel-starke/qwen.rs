@@ -1,0 +1,499 @@
+# Instruction pairs that share a resource of the processor: `X | Y | cycles:RESOURCE ...`,
+# Y not to be issued that many cycles after X (0: not in one bundle); read by
+# src/shave/conflicts.rs. Resources: `irf.rN` / `irf.wN` read / write port N of the
+# integer register file, `vrf.rN` / `vrf.wN` of the vector register file, `shared.N`
+# another shared datapath. Functional facts of the processor (see NPU.md "Provenance").
+CMU.ALIGNVEC v v v # | SAU.SUMX.F32 i v | 0:vrf.r2
+CMU.CMII.I32 i i | LSU1.LD.128 v i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LD.128.16.R v i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LD.128.F16.F32 v i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LD.16 i.e i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LD.32 i i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LD.64 v.e i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LDO.16 i.e i # | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LDO.32 i i # | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LDO.64 i i # | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.LDO.64 v.e i # | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.ST.128 v i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.ST.16 i.e i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.ST.32 i i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.ST.64 v.e i | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.STO.16 i.e i # | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.STO.32 i i # | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.STO.64 i i # | 0:irf.r6
+CMU.CMII.I32 i i | LSU1.STO.64 v.e i # | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LD.128 v i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LD.128.16.R v i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LD.128.F16.F32 v i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LD.16 i.e i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LD.32 i i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LD.64 v.e i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LDO.16 i.e i # | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LDO.32 i i # | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LDO.64 i i # | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.LDO.64 v.e i # | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.ST.128 v i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.ST.16 i.e i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.ST.32 i i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.ST.64 v.e i | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.STO.16 i.e i # | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.STO.32 i i # | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.STO.64 i i # | 0:irf.r6
+CMU.CMII.I8 i i | LSU1.STO.64 v.e i # | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LD.128 v i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LD.128.16.R v i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LD.128.F16.F32 v i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LD.16 i.e i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LD.32 i i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LD.64 v.e i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LDO.16 i.e i # | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LDO.32 i i # | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LDO.64 i i # | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.LDO.64 v.e i # | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.ST.128 v i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.ST.16 i.e i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.ST.32 i i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.ST.64 v.e i | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.STO.16 i.e i # | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.STO.32 i i # | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.STO.64 i i # | 0:irf.r6
+CMU.CMII.U32 i i | LSU1.STO.64 v.e i # | 0:irf.r6
+CMU.CP.128.F32.I32S v v | CMU.ALIGNVEC v v v # | 1:vrf.w1
+CMU.CP.128.F32.I32S v v | CMU.CP.128 v v | 1:vrf.w1
+CMU.CP.128.F32.I32S v v | CMU.CP.128.16.R v i.e | 1:vrf.w1
+CMU.CP.128.F32.I32S v v | CMU.CP.128.32.R v i | 1:vrf.w1
+CMU.CP.128.F32.I32S v v | CMU.CP.128.F16.F32 v v.e | 1:vrf.w1
+CMU.CP.128.I32.F32 v v | CMU.ALIGNVEC v v v # | 1:vrf.w1
+CMU.CP.128.I32.F32 v v | CMU.CP.128 v v | 1:vrf.w1
+CMU.CP.128.I32.F32 v v | CMU.CP.128.16.R v i.e | 1:vrf.w1
+CMU.CP.128.I32.F32 v v | CMU.CP.128.32.R v i | 1:vrf.w1
+CMU.CP.128.I32.F32 v v | CMU.CP.128.F16.F32 v v.e | 1:vrf.w1
+CMU.CP.64.F16.U8FS v.e v | CMU.ALIGNVEC v v v # | 1:vrf.w1
+CMU.CP.64.F16.U8FS v.e v | CMU.CP.128 v v | 1:vrf.w1
+CMU.CP.64.F16.U8FS v.e v | CMU.CP.128.16.R v i.e | 1:vrf.w1
+CMU.CP.64.F16.U8FS v.e v | CMU.CP.128.32.R v i | 1:vrf.w1
+CMU.CP.64.F16.U8FS v.e v | CMU.CP.128.F16.F32 v v.e | 1:vrf.w1
+CMU.MAX.F16 v v v | CMU.ALIGNVEC v v v # | 1:vrf.w1
+CMU.MAX.F16 v v v | CMU.CMII.I32 i i | 1:shared.8
+CMU.MAX.F16 v v v | CMU.CMII.I8 i i | 1:shared.8
+CMU.MAX.F16 v v v | CMU.CMII.U32 i i | 1:shared.8
+CMU.MAX.F16 v v v | CMU.CMPI i # | 1:shared.8
+CMU.MAX.F16 v v v | CMU.CMZ.I32 i | 1:shared.8
+CMU.MAX.F16 v v v | CMU.CP.128 v v | 1:vrf.w1
+CMU.MAX.F16 v v v | CMU.CP.128.16.R v i.e | 1:vrf.w1
+CMU.MAX.F16 v v v | CMU.CP.128.32.R v i | 1:vrf.w1
+CMU.MAX.F16 v v v | CMU.CP.128.F16.F32 v v.e | 1:vrf.w1
+CMU.MAX.F16 v v v | SAU.SUMX.F32 i v | 0:vrf.r2
+CMU.MAX.F32 v v v | CMU.ALIGNVEC v v v # | 1:vrf.w1
+CMU.MAX.F32 v v v | CMU.CMII.I32 i i | 1:shared.8
+CMU.MAX.F32 v v v | CMU.CMII.I8 i i | 1:shared.8
+CMU.MAX.F32 v v v | CMU.CMII.U32 i i | 1:shared.8
+CMU.MAX.F32 v v v | CMU.CMPI i # | 1:shared.8
+CMU.MAX.F32 v v v | CMU.CMZ.I32 i | 1:shared.8
+CMU.MAX.F32 v v v | CMU.CP.128 v v | 1:vrf.w1
+CMU.MAX.F32 v v v | CMU.CP.128.16.R v i.e | 1:vrf.w1
+CMU.MAX.F32 v v v | CMU.CP.128.32.R v i | 1:vrf.w1
+CMU.MAX.F32 v v v | CMU.CP.128.F16.F32 v v.e | 1:vrf.w1
+CMU.MAX.F32 v v v | SAU.SUMX.F32 i v | 0:vrf.r2
+CMU.MIN.F16 v v v | CMU.ALIGNVEC v v v # | 1:vrf.w1
+CMU.MIN.F16 v v v | CMU.CMII.I32 i i | 1:shared.8
+CMU.MIN.F16 v v v | CMU.CMII.I8 i i | 1:shared.8
+CMU.MIN.F16 v v v | CMU.CMII.U32 i i | 1:shared.8
+CMU.MIN.F16 v v v | CMU.CMPI i # | 1:shared.8
+CMU.MIN.F16 v v v | CMU.CMZ.I32 i | 1:shared.8
+CMU.MIN.F16 v v v | CMU.CP.128 v v | 1:vrf.w1
+CMU.MIN.F16 v v v | CMU.CP.128.16.R v i.e | 1:vrf.w1
+CMU.MIN.F16 v v v | CMU.CP.128.32.R v i | 1:vrf.w1
+CMU.MIN.F16 v v v | CMU.CP.128.F16.F32 v v.e | 1:vrf.w1
+CMU.MIN.F16 v v v | SAU.SUMX.F32 i v | 0:vrf.r2
+CMU.MIN.F32 v v v | CMU.ALIGNVEC v v v # | 1:vrf.w1
+CMU.MIN.F32 v v v | CMU.CMII.I32 i i | 1:shared.8
+CMU.MIN.F32 v v v | CMU.CMII.I8 i i | 1:shared.8
+CMU.MIN.F32 v v v | CMU.CMII.U32 i i | 1:shared.8
+CMU.MIN.F32 v v v | CMU.CMPI i # | 1:shared.8
+CMU.MIN.F32 v v v | CMU.CMZ.I32 i | 1:shared.8
+CMU.MIN.F32 v v v | CMU.CP.128 v v | 1:vrf.w1
+CMU.MIN.F32 v v v | CMU.CP.128.16.R v i.e | 1:vrf.w1
+CMU.MIN.F32 v v v | CMU.CP.128.32.R v i | 1:vrf.w1
+CMU.MIN.F32 v v v | CMU.CP.128.F16.F32 v v.e | 1:vrf.w1
+CMU.MIN.F32 v v v | SAU.SUMX.F32 i v | 0:vrf.r2
+IAU.LMULH i i i | IAU.ADD i i # | 1:irf.w0
+IAU.LMULH i i i | IAU.ADD i i i | 1:irf.w0
+IAU.LMULH i i i | IAU.ADDCI i i i | 1:irf.w0
+IAU.LMULH i i i | IAU.AND i i i | 1:irf.w0
+IAU.LMULH i i i | IAU.INCS i # | 1:irf.w0
+IAU.LMULH i i i | IAU.OR i i i | 1:irf.w0
+IAU.LMULH i i i | IAU.SHL i i # | 1:irf.w0
+IAU.LMULH i i i | IAU.SHR.U32 i i # | 1:irf.w0
+IAU.LMULH i i i | IAU.SUB i i # | 1:irf.w0
+IAU.LMULH i i i | IAU.SUB i i i | 1:irf.w0
+IAU.LMULH i i i | IAU.XOR i i i | 1:irf.w0
+IAU.LMULL i i i | IAU.ADD i i # | 1:irf.w0
+IAU.LMULL i i i | IAU.ADD i i i | 1:irf.w0
+IAU.LMULL i i i | IAU.ADDCI i i i | 1:irf.w0
+IAU.LMULL i i i | IAU.AND i i i | 1:irf.w0
+IAU.LMULL i i i | IAU.INCS i # | 1:irf.w0
+IAU.LMULL i i i | IAU.OR i i i | 1:irf.w0
+IAU.LMULL i i i | IAU.SHL i i # | 1:irf.w0
+IAU.LMULL i i i | IAU.SHR.U32 i i # | 1:irf.w0
+IAU.LMULL i i i | IAU.SUB i i # | 1:irf.w0
+IAU.LMULL i i i | IAU.SUB i i i | 1:irf.w0
+IAU.LMULL i i i | IAU.XOR i i i | 1:irf.w0
+IAU.MUL i i i | IAU.ADD i i # | 1:irf.w0
+IAU.MUL i i i | IAU.ADD i i i | 1:irf.w0
+IAU.MUL i i i | IAU.ADDCI i i i | 1:irf.w0
+IAU.MUL i i i | IAU.AND i i i | 1:irf.w0
+IAU.MUL i i i | IAU.INCS i # | 1:irf.w0
+IAU.MUL i i i | IAU.OR i i i | 1:irf.w0
+IAU.MUL i i i | IAU.SHL i i # | 1:irf.w0
+IAU.MUL i i i | IAU.SHR.U32 i i # | 1:irf.w0
+IAU.MUL i i i | IAU.SUB i i # | 1:irf.w0
+IAU.MUL i i i | IAU.SUB i i i | 1:irf.w0
+IAU.MUL i i i | IAU.XOR i i i | 1:irf.w0
+LSU0.CP.32 i i | LSU1.STO.64 i i # | 0:irf.r8
+LSU0.LD.128 v i | LSU0.CP.128 v v | 7:vrf.w2
+LSU0.LD.128 v i | LSU0.LD.128.16.R v i | 1:vrf.w2
+LSU0.LD.128 v i | LSU0.LD.128.F16.F32 v i | 1:vrf.w2
+LSU0.LD.128 v i | LSU0.LD.32 v.e i | 1:vrf.w2
+LSU0.LD.128 v i | LSU0.LD.64 v.e i | 1:vrf.w2
+LSU0.LD.128 v i | LSU0.LDO.64 v.e i # | 1:vrf.w2
+LSU0.LD.128.16.R v i | LSU0.CP.128 v v | 6:vrf.w2
+LSU0.LD.128.F16.F32 v i | LSU0.CP.128 v v | 6:vrf.w2
+LSU0.LD.16 i.e i | LSU0.CP.16 i.e v.e | 6:irf.w4
+LSU0.LD.16 i.e i | LSU0.CP.32 i i | 6:irf.w4
+LSU0.LD.16 i.e i | LSU0.LDIH i # | 6:irf.w4
+LSU0.LD.16 i.e i | LSU0.LDIL i # | 6:irf.w4
+LSU0.LD.16 i.e i | LSU1.LDO.64 i i # | 0:irf.w4
+LSU0.LD.32 i i | LSU0.CP.16 i.e v.e | 6:irf.w4
+LSU0.LD.32 i i | LSU0.CP.32 i i | 6:irf.w4
+LSU0.LD.32 i i | LSU0.LDIH i # | 6:irf.w4
+LSU0.LD.32 i i | LSU0.LDIL i # | 6:irf.w4
+LSU0.LD.32 i i | LSU1.LDO.64 i i # | 0:irf.w4
+LSU0.LD.32 v.e i | LSU0.CP.128 v v | 6:vrf.w2
+LSU0.LD.64 v.e i | LSU0.CP.128 v v | 6:vrf.w2
+LSU0.LDO.16 i.e i # | LSU0.CP.16 i.e v.e | 6:irf.w4
+LSU0.LDO.16 i.e i # | LSU0.CP.32 i i | 6:irf.w4
+LSU0.LDO.16 i.e i # | LSU0.LDIH i # | 6:irf.w4
+LSU0.LDO.16 i.e i # | LSU0.LDIL i # | 6:irf.w4
+LSU0.LDO.16 i.e i # | LSU1.LDO.64 i i # | 0:irf.w4
+LSU0.LDO.32 i i # | LSU0.CP.16 i.e v.e | 6:irf.w4
+LSU0.LDO.32 i i # | LSU0.CP.32 i i | 6:irf.w4
+LSU0.LDO.32 i i # | LSU0.LDIH i # | 6:irf.w4
+LSU0.LDO.32 i i # | LSU0.LDIL i # | 6:irf.w4
+LSU0.LDO.32 i i # | LSU1.LDO.64 i i # | 0:irf.w4
+LSU0.LDO.64 i i # | LSU0.CP.16 i.e v.e | 6:irf.w4
+LSU0.LDO.64 i i # | LSU0.CP.32 i i | 6:irf.w4
+LSU0.LDO.64 i i # | LSU0.LDIH i # | 6:irf.w4
+LSU0.LDO.64 i i # | LSU0.LDIL i # | 6:irf.w4
+LSU0.LDO.64 i i # | LSU1.CP.32 i i | 6:irf.w5
+LSU0.LDO.64 i i # | LSU1.LD.16 i.e i | 0:irf.w5
+LSU0.LDO.64 i i # | LSU1.LD.32 i i | 0:irf.w5
+LSU0.LDO.64 i i # | LSU1.LDIH i # | 6:irf.w5
+LSU0.LDO.64 i i # | LSU1.LDIL i # | 6:irf.w5
+LSU0.LDO.64 i i # | LSU1.LDO.16 i.e i # | 0:irf.w5
+LSU0.LDO.64 i i # | LSU1.LDO.32 i i # | 0:irf.w5
+LSU0.LDO.64 i i # | LSU1.LDO.64 i i # | 0:irf.w5
+LSU0.LDO.64 v.e i # | LSU0.CP.128 v v | 6:vrf.w2
+LSU0.ST.16.F32.F16 i i | LSU1.STO.64 i i # | 0:irf.r8
+LSU0.STO.16 i.e i # | LSU1.STO.64 i i # | 0:irf.r8
+LSU0.STO.32 i i # | LSU1.STO.64 i i # | 0:irf.r8
+LSU0.STO.64 i i # | LSU1.CP.32 i i | 0:irf.r9
+LSU0.STO.64 i i # | LSU1.ST.16 i.e i | 0:irf.r9
+LSU0.STO.64 i i # | LSU1.ST.32 i i | 0:irf.r9
+LSU0.STO.64 i i # | LSU1.STO.16 i.e i # | 0:irf.r9
+LSU0.STO.64 i i # | LSU1.STO.32 i i # | 0:irf.r9
+LSU0.STO.64 i i # | LSU1.STO.64 i i # | 0:irf.r9
+LSU1.LD.128 v i | LSU1.CP.128 v v | 7:vrf.w3
+LSU1.LD.128 v i | LSU1.LD.128.16.R v i | 1:vrf.w3
+LSU1.LD.128 v i | LSU1.LD.128.F16.F32 v i | 1:vrf.w3
+LSU1.LD.128 v i | LSU1.LD.64 v.e i | 1:vrf.w3
+LSU1.LD.128 v i | LSU1.LDO.64 v.e i # | 1:vrf.w3
+LSU1.LD.128.16.R v i | LSU1.CP.128 v v | 6:vrf.w3
+LSU1.LD.128.F16.F32 v i | LSU1.CP.128 v v | 6:vrf.w3
+LSU1.LD.16 i.e i | LSU1.CP.32 i i | 6:irf.w5
+LSU1.LD.16 i.e i | LSU1.LDIH i # | 6:irf.w5
+LSU1.LD.16 i.e i | LSU1.LDIL i # | 6:irf.w5
+LSU1.LD.32 i i | LSU1.CP.32 i i | 6:irf.w5
+LSU1.LD.32 i i | LSU1.LDIH i # | 6:irf.w5
+LSU1.LD.32 i i | LSU1.LDIL i # | 6:irf.w5
+LSU1.LD.64 v.e i | LSU1.CP.128 v v | 6:vrf.w3
+LSU1.LDO.16 i.e i # | LSU1.CP.32 i i | 6:irf.w5
+LSU1.LDO.16 i.e i # | LSU1.LDIH i # | 6:irf.w5
+LSU1.LDO.16 i.e i # | LSU1.LDIL i # | 6:irf.w5
+LSU1.LDO.32 i i # | LSU1.CP.32 i i | 6:irf.w5
+LSU1.LDO.32 i i # | LSU1.LDIH i # | 6:irf.w5
+LSU1.LDO.32 i i # | LSU1.LDIL i # | 6:irf.w5
+LSU1.LDO.64 i i # | LSU0.CP.16 i.e v.e | 6:irf.w4
+LSU1.LDO.64 i i # | LSU0.CP.32 i i | 6:irf.w4
+LSU1.LDO.64 i i # | LSU0.LDIH i # | 6:irf.w4
+LSU1.LDO.64 i i # | LSU0.LDIL i # | 6:irf.w4
+LSU1.LDO.64 i i # | LSU1.CP.32 i i | 6:irf.w5
+LSU1.LDO.64 i i # | LSU1.LDIH i # | 6:irf.w5
+LSU1.LDO.64 i i # | LSU1.LDIL i # | 6:irf.w5
+LSU1.LDO.64 v.e i # | LSU1.CP.128 v v | 6:vrf.w3
+SAU.ADD.I32 i i # | SAU.AND i i i | 1:irf.w1
+SAU.ADD.I32 i i # | SAU.OR i i i | 1:irf.w1
+SAU.ADD.I32 i i # | VAU.ADD.F16 v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.ADD.F32 v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.ADD.I32 v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.AND v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.EXP v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.LOG v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.MUL.F16 v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.MUL.F32 v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.OR v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.SHR.I32 v v # | 0:shared.5
+SAU.ADD.I32 i i # | VAU.SIGM v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.SQT v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.SUB.F16 v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.SUB.F32 v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.SUB.I32 v v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.TANH v v | 0:shared.5
+SAU.ADD.I32 i i # | VAU.XOR v v v | 0:shared.5
+SAU.ADD.I32 i i i | SAU.AND i i i | 1:irf.w1
+SAU.ADD.I32 i i i | SAU.OR i i i | 1:irf.w1
+SAU.ADD.I32 i i i | VAU.ADD.F16 v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.ADD.F32 v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.ADD.I32 v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.AND v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.EXP v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.LOG v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.MUL.F16 v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.MUL.F32 v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.OR v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.SHR.I32 v v # | 0:shared.5
+SAU.ADD.I32 i i i | VAU.SIGM v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.SQT v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.SUB.F16 v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.SUB.F32 v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.SUB.I32 v v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.TANH v v | 0:shared.5
+SAU.ADD.I32 i i i | VAU.XOR v v v | 0:shared.5
+SAU.AND i i i | VAU.ADD.F16 v v v | 0:shared.5
+SAU.AND i i i | VAU.ADD.F32 v v v | 0:shared.5
+SAU.AND i i i | VAU.ADD.I32 v v v | 0:shared.5
+SAU.AND i i i | VAU.AND v v v | 0:shared.5
+SAU.AND i i i | VAU.EXP v v | 0:shared.5
+SAU.AND i i i | VAU.LOG v v | 0:shared.5
+SAU.AND i i i | VAU.MUL.F16 v v v | 0:shared.5
+SAU.AND i i i | VAU.MUL.F32 v v v | 0:shared.5
+SAU.AND i i i | VAU.OR v v v | 0:shared.5
+SAU.AND i i i | VAU.SHR.I32 v v # | 0:shared.5
+SAU.AND i i i | VAU.SIGM v v | 0:shared.5
+SAU.AND i i i | VAU.SQT v v | 0:shared.5
+SAU.AND i i i | VAU.SUB.F16 v v v | 0:shared.5
+SAU.AND i i i | VAU.SUB.F32 v v v | 0:shared.5
+SAU.AND i i i | VAU.SUB.I32 v v v | 0:shared.5
+SAU.AND i i i | VAU.TANH v v | 0:shared.5
+SAU.AND i i i | VAU.XOR v v v | 0:shared.5
+SAU.MUL.I32 i i i | SAU.ADD.I32 i i # | 1:irf.w1
+SAU.MUL.I32 i i i | SAU.ADD.I32 i i i | 1:irf.w1
+SAU.MUL.I32 i i i | SAU.AND i i i | 2:irf.w1
+SAU.MUL.I32 i i i | SAU.OR i i i | 2:irf.w1
+SAU.MUL.I32 i i i | SAU.SHL.X32 i i # | 1:irf.w1
+SAU.MUL.I32 i i i | SAU.SHR.U32 i i # | 1:irf.w1
+SAU.MUL.I32 i i i | VAU.ADD.F16 v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.ADD.F32 v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.ADD.I32 v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.AND v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.EXP v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.LOG v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.MUL.F16 v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.MUL.F32 v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.OR v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.SHR.I32 v v # | 0:shared.5
+SAU.MUL.I32 i i i | VAU.SIGM v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.SQT v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.SUB.F16 v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.SUB.F32 v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.SUB.I32 v v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.TANH v v | 0:shared.5
+SAU.MUL.I32 i i i | VAU.XOR v v v | 0:shared.5
+SAU.OR i i i | VAU.ADD.F16 v v v | 0:shared.5
+SAU.OR i i i | VAU.ADD.F32 v v v | 0:shared.5
+SAU.OR i i i | VAU.ADD.I32 v v v | 0:shared.5
+SAU.OR i i i | VAU.AND v v v | 0:shared.5
+SAU.OR i i i | VAU.EXP v v | 0:shared.5
+SAU.OR i i i | VAU.LOG v v | 0:shared.5
+SAU.OR i i i | VAU.MUL.F16 v v v | 0:shared.5
+SAU.OR i i i | VAU.MUL.F32 v v v | 0:shared.5
+SAU.OR i i i | VAU.OR v v v | 0:shared.5
+SAU.OR i i i | VAU.SHR.I32 v v # | 0:shared.5
+SAU.OR i i i | VAU.SIGM v v | 0:shared.5
+SAU.OR i i i | VAU.SQT v v | 0:shared.5
+SAU.OR i i i | VAU.SUB.F16 v v v | 0:shared.5
+SAU.OR i i i | VAU.SUB.F32 v v v | 0:shared.5
+SAU.OR i i i | VAU.SUB.I32 v v v | 0:shared.5
+SAU.OR i i i | VAU.TANH v v | 0:shared.5
+SAU.OR i i i | VAU.XOR v v v | 0:shared.5
+SAU.RCP i i.e | SAU.ADD.I32 i i # | 3:irf.w1
+SAU.RCP i i.e | SAU.ADD.I32 i i i | 3:irf.w1
+SAU.RCP i i.e | SAU.AND i i i | 4:irf.w1
+SAU.RCP i i.e | SAU.MUL.I32 i i i | 2:irf.w1
+SAU.RCP i i.e | SAU.OR i i i | 4:irf.w1
+SAU.RCP i i.e | SAU.SHL.X32 i i # | 3:irf.w1
+SAU.RCP i i.e | SAU.SHR.U32 i i # | 3:irf.w1
+SAU.RQT i i.e | SAU.ADD.I32 i i # | 3:irf.w1
+SAU.RQT i i.e | SAU.ADD.I32 i i i | 3:irf.w1
+SAU.RQT i i.e | SAU.AND i i i | 4:irf.w1
+SAU.RQT i i.e | SAU.MUL.I32 i i i | 2:irf.w1
+SAU.RQT i i.e | SAU.OR i i i | 4:irf.w1
+SAU.RQT i i.e | SAU.SHL.X32 i i # | 3:irf.w1
+SAU.RQT i i.e | SAU.SHR.U32 i i # | 3:irf.w1
+SAU.SHL.X32 i i # | SAU.AND i i i | 1:irf.w1
+SAU.SHL.X32 i i # | SAU.OR i i i | 1:irf.w1
+SAU.SHL.X32 i i # | VAU.ADD.F16 v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.ADD.F32 v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.ADD.I32 v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.AND v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.EXP v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.LOG v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.MUL.F16 v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.MUL.F32 v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.OR v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.SHR.I32 v v # | 0:shared.5
+SAU.SHL.X32 i i # | VAU.SIGM v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.SQT v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.SUB.F16 v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.SUB.F32 v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.SUB.I32 v v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.TANH v v | 0:shared.5
+SAU.SHL.X32 i i # | VAU.XOR v v v | 0:shared.5
+SAU.SHR.U32 i i # | SAU.AND i i i | 1:irf.w1
+SAU.SHR.U32 i i # | SAU.OR i i i | 1:irf.w1
+SAU.SHR.U32 i i # | VAU.ADD.F16 v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.ADD.F32 v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.ADD.I32 v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.AND v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.EXP v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.LOG v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.MUL.F16 v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.MUL.F32 v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.OR v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.SHR.I32 v v # | 0:shared.5
+SAU.SHR.U32 i i # | VAU.SIGM v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.SQT v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.SUB.F16 v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.SUB.F32 v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.SUB.I32 v v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.TANH v v | 0:shared.5
+SAU.SHR.U32 i i # | VAU.XOR v v v | 0:shared.5
+SAU.SQT i i.e | SAU.ADD.I32 i i # | 3:irf.w1
+SAU.SQT i i.e | SAU.ADD.I32 i i i | 3:irf.w1
+SAU.SQT i i.e | SAU.AND i i i | 4:irf.w1
+SAU.SQT i i.e | SAU.MUL.I32 i i i | 2:irf.w1
+SAU.SQT i i.e | SAU.OR i i i | 4:irf.w1
+SAU.SQT i i.e | SAU.SHL.X32 i i # | 3:irf.w1
+SAU.SQT i i.e | SAU.SHR.U32 i i # | 3:irf.w1
+SAU.SUMX.F32 i v | SAU.ADD.I32 i i # | 3:irf.w1
+SAU.SUMX.F32 i v | SAU.ADD.I32 i i i | 3:irf.w1
+SAU.SUMX.F32 i v | SAU.AND i i i | 4:irf.w1
+SAU.SUMX.F32 i v | SAU.MUL.I32 i i i | 2:irf.w1
+SAU.SUMX.F32 i v | SAU.OR i i i | 4:irf.w1
+SAU.SUMX.F32 i v | SAU.SHL.X32 i i # | 3:irf.w1
+SAU.SUMX.F32 i v | SAU.SHR.U32 i i # | 3:irf.w1
+VAU.ADD.F16 v v v | VAU.ADD.I32 v v v | 1:vrf.w0
+VAU.ADD.F16 v v v | VAU.AND v v v | 2:vrf.w0
+VAU.ADD.F16 v v v | VAU.OR v v v | 2:vrf.w0
+VAU.ADD.F16 v v v | VAU.SHR.I32 v v # | 1:vrf.w0
+VAU.ADD.F16 v v v | VAU.SUB.I32 v v v | 1:vrf.w0
+VAU.ADD.F16 v v v | VAU.XOR v v v | 2:vrf.w0
+VAU.ADD.F32 v v v | VAU.ADD.I32 v v v | 1:vrf.w0
+VAU.ADD.F32 v v v | VAU.AND v v v | 2:vrf.w0
+VAU.ADD.F32 v v v | VAU.OR v v v | 2:vrf.w0
+VAU.ADD.F32 v v v | VAU.SHR.I32 v v # | 1:vrf.w0
+VAU.ADD.F32 v v v | VAU.SUB.I32 v v v | 1:vrf.w0
+VAU.ADD.F32 v v v | VAU.XOR v v v | 2:vrf.w0
+VAU.ADD.I32 v v v | VAU.AND v v v | 1:vrf.w0
+VAU.ADD.I32 v v v | VAU.OR v v v | 1:vrf.w0
+VAU.ADD.I32 v v v | VAU.XOR v v v | 1:vrf.w0
+VAU.EXP v v | VAU.ADD.F16 v v v | 2:vrf.w0
+VAU.EXP v v | VAU.ADD.F32 v v v | 2:vrf.w0
+VAU.EXP v v | VAU.ADD.I32 v v v | 3:vrf.w0
+VAU.EXP v v | VAU.AND v v v | 4:vrf.w0
+VAU.EXP v v | VAU.MUL.F16 v v v | 2:vrf.w0
+VAU.EXP v v | VAU.MUL.F32 v v v | 2:vrf.w0
+VAU.EXP v v | VAU.OR v v v | 4:vrf.w0
+VAU.EXP v v | VAU.SHR.I32 v v # | 3:vrf.w0
+VAU.EXP v v | VAU.SUB.F16 v v v | 2:vrf.w0
+VAU.EXP v v | VAU.SUB.F32 v v v | 2:vrf.w0
+VAU.EXP v v | VAU.SUB.I32 v v v | 3:vrf.w0
+VAU.EXP v v | VAU.XOR v v v | 4:vrf.w0
+VAU.LOG v v | VAU.ADD.F16 v v v | 2:vrf.w0
+VAU.LOG v v | VAU.ADD.F32 v v v | 2:vrf.w0
+VAU.LOG v v | VAU.ADD.I32 v v v | 3:vrf.w0
+VAU.LOG v v | VAU.AND v v v | 4:vrf.w0
+VAU.LOG v v | VAU.MUL.F16 v v v | 2:vrf.w0
+VAU.LOG v v | VAU.MUL.F32 v v v | 2:vrf.w0
+VAU.LOG v v | VAU.OR v v v | 4:vrf.w0
+VAU.LOG v v | VAU.SHR.I32 v v # | 3:vrf.w0
+VAU.LOG v v | VAU.SUB.F16 v v v | 2:vrf.w0
+VAU.LOG v v | VAU.SUB.F32 v v v | 2:vrf.w0
+VAU.LOG v v | VAU.SUB.I32 v v v | 3:vrf.w0
+VAU.LOG v v | VAU.XOR v v v | 4:vrf.w0
+VAU.MUL.F16 v v v | VAU.ADD.I32 v v v | 1:vrf.w0
+VAU.MUL.F16 v v v | VAU.AND v v v | 2:vrf.w0
+VAU.MUL.F16 v v v | VAU.OR v v v | 2:vrf.w0
+VAU.MUL.F16 v v v | VAU.SHR.I32 v v # | 1:vrf.w0
+VAU.MUL.F16 v v v | VAU.SUB.I32 v v v | 1:vrf.w0
+VAU.MUL.F16 v v v | VAU.XOR v v v | 2:vrf.w0
+VAU.MUL.F32 v v v | VAU.ADD.I32 v v v | 1:vrf.w0
+VAU.MUL.F32 v v v | VAU.AND v v v | 2:vrf.w0
+VAU.MUL.F32 v v v | VAU.OR v v v | 2:vrf.w0
+VAU.MUL.F32 v v v | VAU.SHR.I32 v v # | 1:vrf.w0
+VAU.MUL.F32 v v v | VAU.SUB.I32 v v v | 1:vrf.w0
+VAU.MUL.F32 v v v | VAU.XOR v v v | 2:vrf.w0
+VAU.SHR.I32 v v # | VAU.AND v v v | 1:vrf.w0
+VAU.SHR.I32 v v # | VAU.OR v v v | 1:vrf.w0
+VAU.SHR.I32 v v # | VAU.XOR v v v | 1:vrf.w0
+VAU.SIGM v v | VAU.ADD.F16 v v v | 2:vrf.w0
+VAU.SIGM v v | VAU.ADD.F32 v v v | 2:vrf.w0
+VAU.SIGM v v | VAU.ADD.I32 v v v | 3:vrf.w0
+VAU.SIGM v v | VAU.AND v v v | 4:vrf.w0
+VAU.SIGM v v | VAU.MUL.F16 v v v | 2:vrf.w0
+VAU.SIGM v v | VAU.MUL.F32 v v v | 2:vrf.w0
+VAU.SIGM v v | VAU.OR v v v | 4:vrf.w0
+VAU.SIGM v v | VAU.SHR.I32 v v # | 3:vrf.w0
+VAU.SIGM v v | VAU.SUB.F16 v v v | 2:vrf.w0
+VAU.SIGM v v | VAU.SUB.F32 v v v | 2:vrf.w0
+VAU.SIGM v v | VAU.SUB.I32 v v v | 3:vrf.w0
+VAU.SIGM v v | VAU.XOR v v v | 4:vrf.w0
+VAU.SQT v v | VAU.ADD.F16 v v v | 2:vrf.w0
+VAU.SQT v v | VAU.ADD.F32 v v v | 2:vrf.w0
+VAU.SQT v v | VAU.ADD.I32 v v v | 3:vrf.w0
+VAU.SQT v v | VAU.AND v v v | 4:vrf.w0
+VAU.SQT v v | VAU.MUL.F16 v v v | 2:vrf.w0
+VAU.SQT v v | VAU.MUL.F32 v v v | 2:vrf.w0
+VAU.SQT v v | VAU.OR v v v | 4:vrf.w0
+VAU.SQT v v | VAU.SHR.I32 v v # | 3:vrf.w0
+VAU.SQT v v | VAU.SUB.F16 v v v | 2:vrf.w0
+VAU.SQT v v | VAU.SUB.F32 v v v | 2:vrf.w0
+VAU.SQT v v | VAU.SUB.I32 v v v | 3:vrf.w0
+VAU.SQT v v | VAU.XOR v v v | 4:vrf.w0
+VAU.SUB.F16 v v v | VAU.ADD.I32 v v v | 1:vrf.w0
+VAU.SUB.F16 v v v | VAU.AND v v v | 2:vrf.w0
+VAU.SUB.F16 v v v | VAU.OR v v v | 2:vrf.w0
+VAU.SUB.F16 v v v | VAU.SHR.I32 v v # | 1:vrf.w0
+VAU.SUB.F16 v v v | VAU.SUB.I32 v v v | 1:vrf.w0
+VAU.SUB.F16 v v v | VAU.XOR v v v | 2:vrf.w0
+VAU.SUB.F32 v v v | VAU.ADD.I32 v v v | 1:vrf.w0
+VAU.SUB.F32 v v v | VAU.AND v v v | 2:vrf.w0
+VAU.SUB.F32 v v v | VAU.OR v v v | 2:vrf.w0
+VAU.SUB.F32 v v v | VAU.SHR.I32 v v # | 1:vrf.w0
+VAU.SUB.F32 v v v | VAU.SUB.I32 v v v | 1:vrf.w0
+VAU.SUB.F32 v v v | VAU.XOR v v v | 2:vrf.w0
+VAU.SUB.I32 v v v | VAU.AND v v v | 1:vrf.w0
+VAU.SUB.I32 v v v | VAU.OR v v v | 1:vrf.w0
+VAU.SUB.I32 v v v | VAU.XOR v v v | 1:vrf.w0
+VAU.TANH v v | VAU.ADD.F16 v v v | 2:vrf.w0
+VAU.TANH v v | VAU.ADD.F32 v v v | 2:vrf.w0
+VAU.TANH v v | VAU.ADD.I32 v v v | 3:vrf.w0
+VAU.TANH v v | VAU.AND v v v | 4:vrf.w0
+VAU.TANH v v | VAU.MUL.F16 v v v | 2:vrf.w0
+VAU.TANH v v | VAU.MUL.F32 v v v | 2:vrf.w0
+VAU.TANH v v | VAU.OR v v v | 4:vrf.w0
+VAU.TANH v v | VAU.SHR.I32 v v # | 3:vrf.w0
+VAU.TANH v v | VAU.SUB.F16 v v v | 2:vrf.w0
+VAU.TANH v v | VAU.SUB.F32 v v v | 2:vrf.w0
+VAU.TANH v v | VAU.SUB.I32 v v v | 3:vrf.w0
+VAU.TANH v v | VAU.XOR v v v | 4:vrf.w0

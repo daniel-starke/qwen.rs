@@ -1,0 +1,104 @@
+/* Swish and l2 norm of the Flash-Next delta layer's q and k
+ * (`npubuild::flash::graphs::L2_KERNEL`), per 128-wide head row:
+ *   s = x * sigmoid(x),  y = s / sqrt(sum(s^2) + 1e-6)
+ * Carrier: Mish (activation_mish: multi-cluster and multi-SHAVE tiling,
+ * unused elsewhere in the Flash-Next graphs). A = [1, S, 32, 128] (16 q
+ * heads, then 16 k heads); the compiler tiles over the positions, so an
+ * invocation sees dims (innermost first) [128, 32, n, 1] with its rows
+ * consecutive in input and output alike (the kernel relies on it).
+ *
+ * The row's sum of squares is f32 (s^2 of an f16 s is often subnormal in
+ * f16, which the SHAVE flushes to zero), s itself is computed times SC. Pass 1 of a row writes s into the
+ * output and sums its squares; pass 2 scales it there by the row's 1 / norm.
+ * A round runs pass 1 of row r and pass 2 of row r - 1 (one pointer,
+ * disjoint offsets: scheduled together).
+ *
+ *   shave build l2n.sk activation_mish_3720xx.elf
+ *
+ * (and the same ELF as activation_mish_3720xx_lsu0_wo.elf). */
+#define D 128
+#define NV (D / 8)
+/* chains in the sum of squares */
+#ifndef U
+#define U 4
+#endif
+/* vectors per block of a round */
+#ifndef U1
+#define U1 8
+#endif
+_Static_assert(NV % U == 0 && (U & (U - 1)) == 0, "U: a power of 2 that divides D / 8");
+/* s is computed times SC, so an s down to 6.1e-5 / SC stays a normal f16
+   (the SHAVE flushes subnormal inputs to zero); y does not depend on it, eps
+   is scaled with it. |x| up to 65504 / SC. */
+#ifndef SC
+#define SC 16
+#endif
+const float EPS = 1e-6 * SC * SC;
+
+void controlled_act(const u32 *params) {
+    /* MemRefData records, 0x24 bytes each: the input, then the output */
+    const half8 *restrict x = (const half8 *)params[0];
+    half8 *restrict y = (half8 *)params[9];
+    u32 rank = params[2];
+    const u32 *dims = (const u32 *)params[3];
+    /* rows: every dimension but the innermost */
+    u32 n = 1;
+    const u32 *dp = dims + 1;
+    for (u32 d = 1; d < rank; d++) {
+        n *= *dp;
+        dp++;
+    }
+    const float4 eps = EPS, halff = 0.5, threehalf = 1.5;
+    const half8 sc = SC;
+    const int4 magic = 0x5f3759df;
+    register float4 acc[U];
+    /* row 0, pass 1 */
+    for (int v = 0; v < NV; v++) {
+        /* (all at once: more loaded vectors waiting than there are registers) */
+        if (v % U1 == 0 && v > 0) barrier();
+        half8 a = x[v];
+        half8 s = a * sc * sigm(a);
+        y[v] = s;
+        float4 lo = f16_to_f32(s, 0), hi = f16_to_f32(s, 1);
+        if (v < U) acc[v] = lo * lo;
+        else acc[v % U] += lo * lo;
+        acc[v % U] += hi * hi;
+    }
+    for (int s = 1; s < U; s *= 2)
+        for (int u = 0; u + s < U; u += 2 * s) acc[u] += acc[u + s];
+    /* 1 / sqrt(ss + eps): bit-trick seed and 3 Newton steps */
+    float4 t = splat(sum(acc[0])) + eps;
+    float4 r = (float4)(magic - ((int4)t >> 1));
+    float4 ht = t * halff;
+#pragma unroll
+    for (int k = 0; k < 3; k++) r = r * (threehalf - ht * r * r);
+    half8 rs = splat(f32_to_f16(r, 0));
+    x += NV;
+    y += NV;
+    for (u32 i = 1; i < n; i++) {
+        /* row i, pass 1; row i - 1, pass 2 */
+        for (int v = 0; v < NV; v++) {
+            if (v % U1 == 0 && v > 0) barrier();
+            half8 a = x[v];
+            half8 s = a * sc * sigm(a);
+            y[v] = s;
+            float4 lo = f16_to_f32(s, 0), hi = f16_to_f32(s, 1);
+            if (v < U) acc[v] = lo * lo;
+            else acc[v % U] += lo * lo;
+            acc[v % U] += hi * hi;
+            y[v - NV] = y[v - NV] * rs;
+        }
+        for (int s = 1; s < U; s *= 2)
+            for (int u = 0; u + s < U; u += 2 * s) acc[u] += acc[u + s];
+        t = splat(sum(acc[0])) + eps;
+        r = (float4)(magic - ((int4)t >> 1));
+        ht = t * halff;
+#pragma unroll
+        for (int k = 0; k < 3; k++) r = r * (threehalf - ht * r * r);
+        rs = splat(f32_to_f16(r, 0));
+        x += NV;
+        y += NV;
+    }
+    /* the last row, pass 2 */
+    for (int v = 0; v < NV; v++) y[v - NV] = y[v - NV] * rs;
+}

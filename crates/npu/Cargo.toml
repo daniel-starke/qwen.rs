@@ -1,0 +1,23 @@
+[package]
+name = "npu"
+description = "Intel NPU engine through Level Zero, with a SHAVE kernel compiler, assembler and linker."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+# Direct Intel NPU access through Level Zero (`ze_loader.dll`, the NPU
+# driver's graph extension): compile an OpenVINO-format IR with the
+# installed driver's compiler, run a native graph blob, profile it per task.
+# No OpenVINO runtime, no NPUW. Loaded at run time, never linked.
+[dependencies]
+ov = { path = "../ov" }
+quant = { path = "../quant" }
+sampler = { path = "../sampler" }
+
+[lints]
+workspace = true

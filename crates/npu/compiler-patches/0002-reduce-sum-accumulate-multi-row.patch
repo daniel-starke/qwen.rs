@@ -1,0 +1,27 @@
+diff --git a/src/vpux_compiler/src/dialect/IE/transforms/passes/unroll_fully_connected.cpp b/src/vpux_compiler/src/dialect/IE/transforms/passes/unroll_fully_connected.cpp
+index cbb652111..1683b2fbf 100644
+--- a/src/vpux_compiler/src/dialect/IE/transforms/passes/unroll_fully_connected.cpp
++++ b/src/vpux_compiler/src/dialect/IE/transforms/passes/unroll_fully_connected.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++#include <cstdlib>
+ #include "vpux/compiler/core/layers.hpp"
+ #include "vpux/compiler/dialect/IE/IR/dialect.hpp"
+ #include "vpux/compiler/dialect/IE/IR/ops/convolution.hpp"
+@@ -379,7 +380,13 @@ SmallVector<mlir::Value> UnrollFullyConnected::reshapeTo2d(mlir::ValueRange valu
+ bool isBeneficialToUseReduceSumForAccumulate(IE::FullyConnectedOp origOp) {
+     // Benefit when: KV cache model, the first dim is one
+     auto outShape = getShape(origOp.getOutput());
+-    return outShape[Dim(0)] == 1;
++    // qwen.rs: NPU_RS_ACC_MAX=N also takes the ReduceSum form up to N rows
++    // (speculative-verify batches); the Add chain halves the weight stream.
++    static const int64_t maxRows = [] {
++        const char* v = std::getenv("NPU_RS_ACC_MAX");
++        return v ? std::atoll(v) : int64_t{1};
++    }();
++    return outShape[Dim(0)] <= maxRows;
+ }
+ 
+ bool UnrollFullyConnected::isUnrollingBeneficial(IE::FullyConnectedOp origOp, mlir::ValueRange concatInputs) const {

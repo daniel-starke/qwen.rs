@@ -1,0 +1,22 @@
+diff --git a/src/vpux_compiler/src/dialect/VPUMI37XX/blob_writer.cpp b/src/vpux_compiler/src/dialect/VPUMI37XX/blob_writer.cpp
+index 095d9163d..bf5919825 100644
+--- a/src/vpux_compiler/src/dialect/VPUMI37XX/blob_writer.cpp
++++ b/src/vpux_compiler/src/dialect/VPUMI37XX/blob_writer.cpp
+@@ -120,7 +120,7 @@ MVCNN::TensorReference createTensorRef(vpux::NDTypeInterface type, ArrayRef<int6
+     SmallVector<int64_t> shifts;
+ 
+     if (const auto qType = mlir::dyn_cast<mlir::quant::UniformQuantizedType>(type.getElementType())) {
+-        zeroPoints.push_back(checked_cast<uint8_t>(qType.getZeroPoint()));
++        zeroPoints.push_back(static_cast<uint8_t>(static_cast<int8_t>(qType.getZeroPoint())));  // qwen-rs: signed (i4) zero points
+         const auto scaleApproximation = QuantizationApproximation(qType.getScale());
+         mults.push_back(scaleApproximation.mult());
+         shifts.push_back(scaleApproximation.shift());
+@@ -131,7 +131,7 @@ MVCNN::TensorReference createTensorRef(vpux::NDTypeInterface type, ArrayRef<int6
+ 
+         zeroPoints.resize(qtype_quant_zp.size());
+         std::transform(qtype_quant_zp.begin(), qtype_quant_zp.end(), zeroPoints.begin(), [](int64_t val) {
+-            return checked_cast<uint8_t>(val);
++            return static_cast<uint8_t>(static_cast<int8_t>(val));  // qwen-rs: signed (i4) zero points
+         });
+ 
+         mults.resize(qtype_quant_scale.size());

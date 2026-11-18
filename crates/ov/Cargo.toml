@@ -1,0 +1,20 @@
+[package]
+name = "ov"
+description = "OpenVINO runtime backend, loaded at run time, that runs an OpenVINO export of the model on the NPU."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+# OpenVINO runtime backend for an OpenVINO IR export of the model
+# (`openvino_language_model.xml` + `openvino_text_embeddings_model.xml`).
+# The runtime is loaded at run time from `openvino_c.dll`, never linked, so
+# the shipped binary still starts on a host without OpenVINO.
+[dependencies]
+
+[lints]
+workspace = true

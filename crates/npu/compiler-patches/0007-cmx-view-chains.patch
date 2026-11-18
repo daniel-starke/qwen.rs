@@ -1,0 +1,252 @@
+diff --git a/src/vpux_compiler/src/dialect/VPU/transforms/passes/make_ops_with_distributed_tensor.cpp b/src/vpux_compiler/src/dialect/VPU/transforms/passes/make_ops_with_distributed_tensor.cpp
+index 19371a114..1ff424845 100644
+--- a/src/vpux_compiler/src/dialect/VPU/transforms/passes/make_ops_with_distributed_tensor.cpp
++++ b/src/vpux_compiler/src/dialect/VPU/transforms/passes/make_ops_with_distributed_tensor.cpp
+@@ -4,12 +4,14 @@
+ //
+ 
+ #include "vpux/compiler/dialect/VPU/IR/dialect.hpp"
++#include "vpux/compiler/dialect/VPU/IR/ops.hpp"
+ #include "vpux/compiler/dialect/VPU/transforms/factories/make_ops_with_distributed_tensor_strategy_getter.hpp"
+ #include "vpux/compiler/dialect/VPU/transforms/passes.hpp"
+ #include "vpux/compiler/dialect/VPU/utils/distributed_tensor_utils.hpp"
+ #include "vpux/compiler/dialect/VPU/utils/sibling_ops_analysis.hpp"
+ 
+ #include <llvm/ADT/TypeSwitch.h>
++#include <cstdlib>
+ #include <mlir/IR/IRMapping.h>
+ #include <mlir/Transforms/DialectConversion.h>
+ 
+@@ -66,7 +68,49 @@ mlir::LogicalResult MakeOpsWithDistributedTensorPass::initialize(mlir::MLIRConte
+ // safeRunOnModule
+ //
+ 
++
++// qwen.rs (NPU_RS_VIEWFOLD=1): a chain of pure view ops (reshape / permute
++// cast / shape cast) that ends in exactly the type it started from is an
++// identity on the buffer; drop it, so a producer's output reaches its
++// consumer without the CMX -> DDR -> CMX round trip the view chain forces.
++static bool rsIsView(mlir::Operation* op) {
++    return mlir::isa<VPU::AffineReshapeOp, VPU::PermuteCastOp, VPU::ShapeCastOp, VPU::ReshapeOp, VPU::SqueezeOp,
++                     VPU::UnsqueezeOp, VPU::LayoutCastOp>(op) &&
++           op->getNumResults() == 1;
++}
++
++static int rsFoldIdentityViews(mlir::Operation* func) {
++    int n = 0;
++    func->walk([&](mlir::Operation* op) {
++        if (!rsIsView(op)) {
++            return;
++        }
++        auto res = op->getResult(0);
++        mlir::Value v = op->getOperand(0);
++        for (int depth = 0; depth < 16; ++depth) {
++            if (v.getType() == res.getType()) {
++                res.replaceAllUsesWith(v);
++                ++n;
++                return;
++            }
++            auto def = v.getDefiningOp();
++            if (def == nullptr || !rsIsView(def)) {
++                return;
++            }
++            v = def->getOperand(0);
++        }
++    });
++    return n;
++}
++
+ void MakeOpsWithDistributedTensorPass::safeRunOnFunc() {
++    if (const char* e = std::getenv("NPU_RS_VIEWFOLD"); e != nullptr && *e == '1') {
++        const auto n = rsFoldIdentityViews(getOperation());
++        if (std::getenv("NPU_RS_VIEWFOLD_LOG") != nullptr) {
++            llvm::errs() << "NPU_RS_VIEWFOLD: folded " << n << " identity view chains\n";
++        }
++    }
++
+     auto func = getOperation();
+     auto& ctx = getContext();
+ 
+diff --git a/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/optimize_copies.cpp b/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/optimize_copies.cpp
+index c82dbbcf1..68f711815 100644
+--- a/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/optimize_copies.cpp
++++ b/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/optimize_copies.cpp
+@@ -36,6 +36,7 @@
+ #include <mlir/Support/LogicalResult.h>
+ #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
+ #include <stdexcept>
++#include <cstdlib>
+ 
+ namespace vpux::VPUIP {
+ #define GEN_PASS_DECL_OPTIMIZECOPIES
+@@ -2839,6 +2840,161 @@ mlir::LogicalResult CopyOpSequenceWithSubview::matchAndRewrite(VPUIP::CopyOp cop
+     return mlir::failure();
+ }
+ 
++
++//
++// qwen.rs (NPU_RS_DISTVIEW=1): RsDistributedViewChain
++//
++// Copy(distributed CMX -> DDR) -> pure view ops -> Copy(DDR -> distributed CMX)
++// where every cluster's segment of the source and of the destination is the
++// same contiguous byte range of the (compact) DDR tensor: the CMX buffers
++// already hold the destination's bytes, so the destination is a view of the
++// source. The upstream MovePureViewOpBeforeCopy refuses this whenever a view
++// changes the rank (4-D eltwise <-> 5-D grouped MatMul), so such edges went
++// through DDR although nothing moves.
++//
++
++static bool rsDistViewEnabled() {
++    static const bool on = [] {
++        const char* e = std::getenv("NPU_RS_DISTVIEW");
++        return e != nullptr && *e == '1';
++    }();
++    return on;
++}
++
++static bool rsSegmentsContiguous(VPUIP::DistributedBufferType t) {
++    auto dist = t.getDistribution();
++    if (dist.getMode().getValue() != VPU::DistributionMode::SEGMENTED) {
++        return false;
++    }
++    const auto shape = t.getShape();
++    const auto order = t.getDimsOrder();
++    const Bit elem = vpux::getElemTypeSize(t.getElementType());
++    const auto memShape = order.toMemoryOrder(Shape(shape.raw()));
++    const auto compact = order.toLogicalOrder(StrideReqs::compact(order.numDims()).calcStrides(elem, memShape));
++    if (t.getStrides() != compact) {
++        return false;
++    }
++    const auto shapes = t.getPerClusterMemoryShapes();
++    const auto cshapes = t.getPerClusterComputeShapes();
++    if (shapes.size() != cshapes.size()) {
++        return false;
++    }
++    const auto perm = order.toPermutation();
++    for (size_t c = 0; c < shapes.size(); ++c) {
++        if (shapes[c] != cshapes[c]) {
++            return false;
++        }
++        // memory order, outer to inner: dims of size 1, one partial dim, full dims
++        size_t i = 0;
++        while (i < perm.size() && shapes[c][perm[i]] == 1) {
++            ++i;
++        }
++        for (size_t j = i + 1; j < perm.size(); ++j) {
++            if (shapes[c][perm[j]] != shape[perm[j]]) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++static bool rsIsCompact(mlir::Type type) {
++    auto nd = mlir::dyn_cast<vpux::NDTypeInterface>(type);
++    if (nd == nullptr) {
++        return false;
++    }
++    return StrideReqs::compact(nd.getRank()).checkStrides(nd);
++}
++
++class RsDistributedViewChain final : public mlir::OpRewritePattern<VPUIP::CopyOp> {
++public:
++    RsDistributedViewChain(mlir::MLIRContext* ctx, mlir::PatternBenefit benefit, Logger log)
++            : mlir::OpRewritePattern<VPUIP::CopyOp>(ctx, benefit), _log(log) {
++    }
++    mlir::LogicalResult matchAndRewrite(VPUIP::CopyOp dstCopy, mlir::PatternRewriter& rewriter) const final {
++        if (!rsDistViewEnabled()) {
++            return mlir::failure();
++        }
++        auto dstType = mlir::dyn_cast<VPUIP::DistributedBufferType>(dstCopy.getOutputBuff().getType());
++        if (dstType == nullptr || mlir::isa<VPUIP::DistributedBufferType>(dstCopy.getInput().getType())) {
++            return mlir::failure();
++        }
++        if (!rsIsCompact(dstCopy.getInput().getType())) {
++            return mlir::failure();
++        }
++        mlir::Value v = dstCopy.getInput();
++        VPUIP::CopyOp srcCopy = nullptr;
++        for (int depth = 0; depth < 16 && srcCopy == nullptr; ++depth) {
++            auto def = v.getDefiningOp();
++            if (def == nullptr) {
++                return mlir::failure();
++            }
++            if (auto c = mlir::dyn_cast<VPUIP::CopyOp>(def)) {
++                srcCopy = c;
++                break;
++            }
++            if (!mlir::isa<VPUIP::GenericReshapeOp, VPUIP::PermuteCastOp, VPUIP::ShapeCastOp>(def)) {
++                return mlir::failure();
++            }
++            if (!rsIsCompact(def->getOperand(0).getType()) || !rsIsCompact(def->getResult(0).getType())) {
++                return mlir::failure();
++            }
++            v = def->getOperand(0);
++        }
++        if (srcCopy == nullptr) {
++            return mlir::failure();
++        }
++        auto srcType = mlir::dyn_cast<VPUIP::DistributedBufferType>(srcCopy.getInput().getType());
++        if (srcType == nullptr || !rsIsCompact(srcCopy.getOutputBuff().getType())) {
++            return mlir::failure();
++        }
++        if (VPUIP::getRootAlloc<mlir::memref::AllocOp>(srcCopy.getOutputBuff()) == nullptr) {
++            return mlir::failure();
++        }
++        if (srcType.getElementType() != dstType.getElementType() ||
++            srcType.getDistribution().getNumClusters() != dstType.getDistribution().getNumClusters() ||
++            srcType.getShape().totalSize() != dstType.getShape().totalSize()) {
++            return mlir::failure();
++        }
++        if (!rsSegmentsContiguous(srcType) || !rsSegmentsContiguous(dstType)) {
++            return mlir::failure();
++        }
++        if (!VPUIP::areDistributedTypePerClusterDataCompatible<VPUIP::DistributedBufferType>(srcType, dstType)) {
++            return mlir::failure();
++        }
++        _log.trace("RsDistributedViewChain: {0} -> {1}", srcCopy->getLoc(), dstCopy->getLoc());
++        rewriter.replaceOpWithNewOp<VPUIP::ViewOp>(dstCopy, dstCopy.getOutput().getType(), srcCopy.getInput());
++        return mlir::success();
++    }
++
++private:
++    Logger _log;
++};
++
++// A spill copy whose DDR result nobody reads any more (its readers became
++// views of the CMX source above): drop it and its buffer.
++class RsDeadSpillCopy final : public mlir::OpRewritePattern<VPUIP::CopyOp> {
++public:
++    RsDeadSpillCopy(mlir::MLIRContext* ctx, mlir::PatternBenefit benefit)
++            : mlir::OpRewritePattern<VPUIP::CopyOp>(ctx, benefit) {
++    }
++    mlir::LogicalResult matchAndRewrite(VPUIP::CopyOp copy, mlir::PatternRewriter& rewriter) const final {
++        if (!rsDistViewEnabled() || !copy.getOutput().use_empty()) {
++            return mlir::failure();
++        }
++        if (!mlir::isa<VPUIP::DistributedBufferType>(copy.getInput().getType())) {
++            return mlir::failure();
++        }
++        auto alloc = copy.getOutputBuff().getDefiningOp<mlir::memref::AllocOp>();
++        if (alloc == nullptr || !alloc->hasOneUse()) {
++            return mlir::failure();
++        }
++        rewriter.eraseOp(copy);
++        rewriter.eraseOp(alloc);
++        return mlir::success();
++    }
++};
++
+ //
+ // OptimizeCopiesPass
+ //
+@@ -2879,6 +3035,8 @@ void OptimizeCopiesPass::safeRunOnFunc() {
+     patterns.add<DuplicatedCopyWithCMXCopy>(&ctx, benefitLevels[3], _log);
+     patterns.add<FuseCopiesThroughReshape>(&ctx, benefitLevels[3], _log);
+     patterns.add<SubViewWithCopy>(&ctx, benefitLevels[3], _log);
++    patterns.add<RsDistributedViewChain>(&ctx, benefitLevels[0], _log);
++    patterns.add<RsDeadSpillCopy>(&ctx, benefitLevels[0]);
+ 
+     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(func, std::move(patterns), getDefaultGreedyRewriteConfig()))) {
+         signalPassFailure();

@@ -1,0 +1,13 @@
+diff --git a/src/vpux_compiler/src/dialect/VPUIP/utils/utils.cpp b/src/vpux_compiler/src/dialect/VPUIP/utils/utils.cpp
+index 70a0a90fd..2e55cf98b 100644
+--- a/src/vpux_compiler/src/dialect/VPUIP/utils/utils.cpp
++++ b/src/vpux_compiler/src/dialect/VPUIP/utils/utils.cpp
+@@ -39,7 +39,7 @@ uint32_t vpux::VPUIP::getDPUProfMaxBufferSize(config::ArchKind arch) {
+     switch (arch) {
+     case config::ArchKind::NPU37XX:
+     case config::ArchKind::NPU40XX:
+-        return HW_DPU_PROFILING_MAX_BUFFER_SIZE;  // Up to 64 DPU Tasks in single CMX DPU profiling buffer instance
++        return 4 * HW_DPU_PROFILING_MAX_BUFFER_SIZE;  // qwen.rs: x4 for profiling big graphs  // Up to 64 DPU Tasks in single CMX DPU profiling buffer instance
+     default:
+         VPUX_THROW("Unable to get DPUProfMaxBufferSize for arch {0}", arch);
+     }

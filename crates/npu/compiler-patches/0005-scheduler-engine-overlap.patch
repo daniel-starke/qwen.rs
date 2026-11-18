@@ -1,0 +1,419 @@
+diff --git a/src/vpux_compiler/include/vpux/compiler/core/feasible_memory_scheduler.hpp b/src/vpux_compiler/include/vpux/compiler/core/feasible_memory_scheduler.hpp
+index bb87cccd3..2a50e0d45 100644
+--- a/src/vpux_compiler/include/vpux/compiler/core/feasible_memory_scheduler.hpp
++++ b/src/vpux_compiler/include/vpux/compiler/core/feasible_memory_scheduler.hpp
+@@ -419,6 +419,12 @@ private:
+     // reporting and schedule generation
+     void populateScheduledOps(const HeapElement& scheduledOp);
+ 
++    // NPU_RS_NOALIGN=1: bound each op by the free cycle of the memory it reuses instead of
++    // aligning every executor to each free (alignExecutors)
++    void paintFreed(size_t addr, size_t size, size_t cycle);
++    size_t freedCycle(size_t addr, size_t size) const;
++    void retimeRound(const mlir::DenseSet<mlir::Value>& newBuffers);
++
+ private:
+     Logger _log;
+     // memory space, which will be allocated
+@@ -508,6 +514,12 @@ private:
+     std::set<EvictionCandidate, EvictionPriority> _evictionCandidatesCache;
+ 
+     llvm::BitVector _isDataOp;
++
++    // NPU_RS_NOALIGN: freed CMX ranges, begin -> (end, cycle the range became free)
++    bool _noAlign = false;
++    std::map<size_t, std::pair<size_t, size_t>> _freePaint;
++    // elements pushed to the cycle begin heap since the last retime, in push order
++    SmallVector<HeapElement> _roundElems;
+ };
+ 
+ }  // namespace vpux
+diff --git a/src/vpux_compiler/src/core/feasible_memory_scheduler.cpp b/src/vpux_compiler/src/core/feasible_memory_scheduler.cpp
+index ee26ec1ca..b0f4b62c6 100644
+--- a/src/vpux_compiler/src/core/feasible_memory_scheduler.cpp
++++ b/src/vpux_compiler/src/core/feasible_memory_scheduler.cpp
+@@ -52,6 +52,10 @@ FeasibleMemoryScheduler::FeasibleMemoryScheduler(VPU::MemoryKind memKind, VPU::M
+           _optimizeFragmentation(optimizeFragmentation) {
+     _log.setName("feasible-memory-scheduler-allocator");
+ 
++    if (const auto* env = std::getenv("NPU_RS_NOALIGN")) {
++        _noAlign = env[0] == '1';
++    }
++
+     auto dmaChannels = getDMAChannelsWithIndependentLinkAgents(arch);
+     for (auto dmaChannel : dmaChannels) {
+         QueueType queueType;
+@@ -108,6 +112,9 @@ void FeasibleMemoryScheduler::updateBufferCycleUseAndProducer(size_t opIdx, size
+ 
+ void FeasibleMemoryScheduler::pushToCycleBeginHeap(const HeapElement& elem) {
+     _cycleBeginHeap.insert(elem);
++    if (_noAlign) {
++        _roundElems.push_back(elem);
++    }
+     // store as writer of output buffers
+     if (elem.isSpillReadOp()) {
+         updateBufferCycleUseAndProducer(elem.op_, elem.cycleEnd_, elem.spillBuffer_, true);
+@@ -150,6 +157,7 @@ void FeasibleMemoryScheduler::moveFromCycleBeginToCycleEndHeap() {
+     }
+ 
+     _cycleBeginHeap.clear();
++    _roundElems.clear();
+ }
+ 
+ VPU::ExecutorKind FeasibleMemoryScheduler::getExecutorType(operationIdxType opIdx) {
+@@ -462,6 +470,15 @@ bool FeasibleMemoryScheduler::freeMemoryResources(const HeapElement& hElement) {
+     for (auto& buffer : _liveRangeInfo.getUsedBuffers(op)) {
+         if (_liveRangeInfo.eraseUser(buffer, op) == 0) {
+             _log.nest().trace("Mark buffer as dead, '{0}'", buffer);
++            if (_noAlign) {
++                size_t freeCycle = hElement.cycleEnd_;
++                auto lastUse = _bufferLastCycleUse.find(buffer);
++                if (lastUse != _bufferLastCycleUse.end()) {
++                    freeCycle = std::max(freeCycle, lastUse->second);
++                }
++                paintFreed(checked_cast<size_t>(_scan.handler().getAddress(buffer)),
++                           checked_cast<size_t>(_scan.handler().getSize(buffer)), freeCycle);
++            }
+             _scan.handler().markAsDead(buffer);
+             freeMemoryResources = true;
+         }
+@@ -540,7 +557,7 @@ void FeasibleMemoryScheduler::unscheduleAllCompletingOps() {
+         }
+ 
+         _log.nest(2).trace("Unschedule opIdx '{0}'", nextOp.op_);
+-        if (freeMemoryResources(nextOp)) {
++        if (freeMemoryResources(nextOp) && !_noAlign) {
+             // align executors only if memory resources freed
+             alignExecutors(nextOp.cycleEnd_);
+         }
+@@ -925,6 +942,139 @@ void FeasibleMemoryScheduler::sortAndAllocateBuffers(mlir::DenseSet<mlir::Value>
+         VPUX_THROW_UNLESS(_scan.alloc(buffersToAllocate, false, Partitioner::Direction::Up),
+                           "Failed to statically allocate '{0}' memory", _memKind);
+     }
++
++    if (_noAlign) {
++        retimeRound(buffersToAllocate);
++    }
++}
++
++void FeasibleMemoryScheduler::paintFreed(size_t addr, size_t size, size_t cycle) {
++    const size_t end = addr + size;
++    if (size == 0) {
++        return;
++    }
++    // split the segments that straddle addr or end
++    auto split = [&](size_t x) {
++        auto it = _freePaint.upper_bound(x);
++        if (it == _freePaint.begin()) {
++            return;
++        }
++        --it;
++        if (it->first < x && x < it->second.first) {
++            const auto segEnd = it->second.first;
++            const auto segCycle = it->second.second;
++            it->second.first = x;
++            _freePaint.emplace(x, std::make_pair(segEnd, segCycle));
++        }
++    };
++    split(addr);
++    split(end);
++    size_t cur = addr;
++    auto it = _freePaint.lower_bound(addr);
++    while (cur < end) {
++        if (it != _freePaint.end() && it->first == cur) {
++            it->second.second = std::max(it->second.second, cycle);
++            cur = it->second.first;
++            ++it;
++        } else {
++            const size_t next = (it != _freePaint.end() && it->first < end) ? it->first : end;
++            _freePaint.emplace(cur, std::make_pair(next, cycle));
++            cur = next;
++        }
++    }
++}
++
++size_t FeasibleMemoryScheduler::freedCycle(size_t addr, size_t size) const {
++    const size_t end = addr + size;
++    size_t cycle = 0;
++    auto it = _freePaint.upper_bound(addr);
++    if (it != _freePaint.begin()) {
++        --it;
++    }
++    for (; it != _freePaint.end() && it->first < end; ++it) {
++        if (it->second.first > addr) {
++            cycle = std::max(cycle, it->second.second);
++        }
++    }
++    return cycle;
++}
++
++// With NPU_RS_NOALIGN the executors are not aligned to every memory free, so an op placed into
++// memory freed by another op may have been given a begin cycle before that free. Once the round's
++// buffers have addresses, move every op pushed in this round (in push order, so producers and
++// earlier ops of the same queue come first) to begin no earlier than the free cycle of the memory
++// its new buffers occupy, and propagate the move to its dependents and its queue.
++void FeasibleMemoryScheduler::retimeRound(const mlir::DenseSet<mlir::Value>& newBuffers) {
++    std::map<QueueType, SmallVector<size_t>> queueEnd;
++    for (const auto& elem0 : _roundElems) {
++        auto it = _cycleBeginHeap.find(elem0);
++        VPUX_THROW_UNLESS(it != _cycleBeginHeap.end(), "retimeRound: op '{0}' not in cycle begin heap", elem0.op_);
++        auto elem = *it;
++        size_t begin = elem.cycleBegin_;
++
++        auto& qEnd = queueEnd[elem.queueType_];
++        if (qEnd.size() < elem.executorInstanceMask_.size()) {
++            qEnd.resize(elem.executorInstanceMask_.size(), 0);
++        }
++        for (auto inst : elem.executorInstanceMask_.set_bits()) {
++            begin = std::max(begin, qEnd[inst]);
++        }
++
++        auto memBound = [&](mlir::Value buffer) {
++            if (newBuffers.contains(buffer)) {
++                begin = std::max(begin, freedCycle(checked_cast<size_t>(_scan.handler().getAddress(buffer)),
++                                                   checked_cast<size_t>(_scan.handler().getSize(buffer))));
++            }
++        };
++        if (elem.isSpillReadOp()) {
++            memBound(elem.spillBuffer_);
++        } else if (elem.isOriginalOp()) {
++            for (const auto& dep : _depsInfo.getOpDeps(elem.op_)) {
++                auto depEnd = _opIdxEndCycleMap.find(dep);
++                if (depEnd != _opIdxEndCycleMap.end()) {
++                    begin = std::max(begin, depEnd->second);
++                }
++            }
++            const auto execOp = _depsInfo.getExecuteOpAtIndex(elem.op_);
++            for (auto& buffer : _liveRangeInfo.getUsedBuffers(execOp)) {
++                auto producer = _bufferProducer.find(buffer);
++                if (producer != _bufferProducer.end() && producer->second != elem.op_) {
++                    auto prodEnd = _opIdxEndCycleMap.find(producer->second);
++                    if (prodEnd != _opIdxEndCycleMap.end()) {
++                        begin = std::max(begin, prodEnd->second);
++                    }
++                }
++                memBound(buffer);
++            }
++        }
++
++        if (begin != elem.cycleBegin_) {
++            VPUX_THROW_UNLESS(begin > elem.cycleBegin_, "retimeRound: op '{0}' moved backwards", elem.op_);
++            _log.nest().trace("Retime op '{0}': {1} -> {2}", elem.op_, elem.cycleBegin_, begin);
++            const auto cost = elem.cycleEnd_ - elem.cycleBegin_;
++            _cycleBeginHeap.erase(it);
++            elem.cycleBegin_ = begin;
++            elem.cycleEnd_ = begin + cost;
++            _cycleBeginHeap.insert(elem);
++            if (elem.isSpillReadOp()) {
++                updateBufferCycleUseAndProducer(elem.op_, elem.cycleEnd_, elem.spillBuffer_);
++            } else if (elem.isOriginalOp()) {
++                const auto execOp = _depsInfo.getExecuteOpAtIndex(elem.op_);
++                for (auto& buffer : _liveRangeInfo.getUsedBuffers(execOp)) {
++                    updateBufferCycleUseAndProducer(elem.op_, elem.cycleEnd_, buffer);
++                }
++            }
++            insertInOpIdxCycleEndMap(elem.op_, elem.cycleEnd_);
++            auto& pipeline = _executorPipelines[elem.queueType_];
++            for (auto inst : elem.executorInstanceMask_.set_bits()) {
++                pipeline[inst] = std::max(pipeline[inst], elem.cycleEnd_);
++            }
++        }
++        for (auto inst : elem.executorInstanceMask_.set_bits()) {
++            qEnd[inst] = std::max(qEnd[inst], elem.cycleEnd_);
++        }
++    }
++    _roundElems.clear();
+ }
+ 
+ void FeasibleMemoryScheduler::scheduleComputeOps() {
+@@ -937,15 +1087,59 @@ void FeasibleMemoryScheduler::scheduleComputeOps() {
+     // Ops which depend on constants or function inputs have lower priority
+     SmallVector<std::pair<operationIdxType, FeasibleMemoryScheduler::QueueType>> noInputDepComputeOps;
+ 
++    // NPU_RS_LOOKAHEAD=K: when the IR-order head of a compute queue is not ready (it waits for an op
++    // on another engine), consider the ready ops among the queue's next K ops instead, so independent
++    // work (e.g. another head group) can run on the idle engine. Default 0 = IR order only.
++    static const size_t lookahead = [] {
++        const auto* env = std::getenv("NPU_RS_LOOKAHEAD");
++        return env != nullptr ? static_cast<size_t>(std::strtoul(env, nullptr, 10)) : size_t(0);
++    }();
++    // further ready candidates per queue, tried in order when the first does not fit
++    std::map<QueueType, SmallVector<operationIdxType>> queueAlternatives;
++
+     // find compute ops to schedule
++    static const bool schedStat = std::getenv("NPU_RS_SCHEDSTAT") != nullptr;
+     for (auto& queue : _computeOpOrder) {
+         auto firstOpInQueue = queue.second.begin();
+         if (firstOpInQueue == queue.second.end()) {
+             // no ops on queue left
+             continue;
+         }
++        if (lookahead > 0) {
++            if (!unscheduledOpsOnQueue(queue.first)) {
++                continue;
++            }
++            SmallVector<operationIdxType> ready;
++            size_t pos = 0;
++            for (auto opIt = queue.second.begin(); opIt != queue.second.end() && pos <= lookahead; ++opIt, ++pos) {
++                if (_readyComputeOps.find(*opIt) != _readyComputeOps.end()) {
++                    ready.push_back(*opIt);
++                }
++            }
++            if (ready.empty()) {
++                continue;
++            }
++            if (isNoInputDepComputeOp(ready.front())) {
++                noInputDepComputeOps.push_back({ready.front(), queue.first});
++            } else {
++                computeOps.push_back({ready.front(), queue.first});
++            }
++            queueAlternatives[queue.first].assign(ready.begin() + 1, ready.end());
++            continue;
++        }
+         if (_readyComputeOps.find(*firstOpInQueue) == _readyComputeOps.end()) {
+             // operation not ready
++            if (schedStat && unscheduledOpsOnQueue(queue.first)) {
++                // idle queue: is a later op of this queue ready?
++                size_t pos = 0;
++                for (auto opIt = queue.second.begin(); opIt != queue.second.end() && pos < 64; ++opIt, ++pos) {
++                    if (_readyComputeOps.find(*opIt) != _readyComputeOps.end()) {
++                        break;
++                    }
++                }
++                llvm::errs() << "SCHEDSTAT idle " << stringifyEnum(queue.first.execKind) << " head "
++                             << *firstOpInQueue << " not ready; first ready at +" << pos << "\n";
++            }
+             continue;
+         }
+         if (!unscheduledOpsOnQueue(queue.first)) {
+@@ -969,6 +1163,17 @@ void FeasibleMemoryScheduler::scheduleComputeOps() {
+             operationBuffers.insert(buffersToAllocate.begin(), buffersToAllocate.end());
+             if (!canAllocBuffers(operationBuffers)) {
+                 // operation does not fit in memory
++                if (schedStat) {
++                    llvm::errs() << "SCHEDSTAT nofit " << stringifyEnum(opIter->second.execKind) << " op "
++                                 << opIter->first << " free " << _scan.totalFreeSize() << "\n";
++                }
++                // lookahead: try the queue's next ready op instead
++                auto alt = queueAlternatives.find(opIter->second);
++                if (alt != queueAlternatives.end() && !alt->second.empty()) {
++                    opIter->first = alt->second.front();
++                    alt->second.erase(alt->second.begin());
++                    continue;
++                }
+                 opIter++;
+                 continue;
+             }
+@@ -978,7 +1183,9 @@ void FeasibleMemoryScheduler::scheduleComputeOps() {
+             computeOpIdxToSchedule.push_back(opIter->first);
+             _log.trace("Compute op to schedule: '{0}'", opIter->first);
+             auto& scheduledQueue = _computeOpOrder[opIter->second];
+-            scheduledQueue.erase(scheduledQueue.begin());
++            auto pos = llvm::find(scheduledQueue, opIter->first);
++            VPUX_THROW_UNLESS(pos != scheduledQueue.end(), "Compute op '{0}' not in its queue", opIter->first);
++            scheduledQueue.erase(pos);
+             opIter = ops.erase(opIter);
+         }
+     };
+@@ -1334,7 +1541,13 @@ void FeasibleMemoryScheduler::forceScheduleActiveOpEviction() {
+     updateCurrentCycleForExecutor(queueAndCycle.queueType, queueAndCycle.execMask, nextAvailableCycle);
+ 
+     // memory resource freed, need to align executors to only allocate in future cycles
+-    alignExecutors(nextAvailableCycle);
++    if (_noAlign) {
++        // the spill write reads the buffer until it ends
++        paintFreed(checked_cast<size_t>(_scan.handler().getAddress(evictionCandidate.buffer_)),
++                   checked_cast<size_t>(_scan.handler().getSize(evictionCandidate.buffer_)), nextAvailableCycle);
++    } else {
++        alignExecutors(nextAvailableCycle);
++    }
+ }
+ 
+ void FeasibleMemoryScheduler::createBufferAsyncIdxMap() {
+@@ -1649,6 +1862,37 @@ FeasibleMemoryScheduler::ScheduledOpInfoVec FeasibleMemoryScheduler::generateSch
+         return false;
+     });
+ 
++    if (std::getenv("NPU_RS_SCHEDSTAT") != nullptr) {
++        // simulated engine overlap: busy cycles per engine and DPU / SHAVE together
++        std::vector<std::tuple<int64_t, int, int>> events;  // cycle, +1/-1, engine (0 DMA, 1 DPU, 2 SHAVE)
++        for (const auto& op : _scheduledOps) {
++            int eng = op.queueType.execKind == VPU::ExecutorKind::DPU         ? 1
++                      : op.queueType.execKind == VPU::ExecutorKind::SHAVE_ACT ? 2
++                      : op.queueType.execKind == VPU::ExecutorKind::DMA_NN    ? 0
++                                                                              : -1;
++            if (eng < 0 || op.cycleEnd_ <= op.cycleBegin_) {
++                continue;
++            }
++            events.emplace_back(op.cycleBegin_, 1, eng);
++            events.emplace_back(op.cycleEnd_, -1, eng);
++        }
++        llvm::sort(events);
++        int cnt[3] = {0, 0, 0};
++        int64_t last = 0, busy[3] = {0, 0, 0}, dpuShave = 0, total = 0;
++        for (auto& [t, d, e] : events) {
++            const int64_t dt = t - last;
++            for (int k = 0; k < 3; ++k) {
++                busy[k] += cnt[k] > 0 ? dt : 0;
++            }
++            dpuShave += (cnt[1] > 0 && cnt[2] > 0) ? dt : 0;
++            total = t;
++            last = t;
++            cnt[e] += d;
++        }
++        llvm::errs() << "SCHEDSUM ops " << _scheduledOps.size() << " span " << total << " DMA " << busy[0] << " DPU "
++                     << busy[1] << " SHAVE " << busy[2] << " DPU+SHAVE " << dpuShave << "\n";
++    }
++
+     return _scheduledOps;
+ }
+ 
+diff --git a/src/vpux_compiler/src/dialect/VPU/IR/attributes.cpp b/src/vpux_compiler/src/dialect/VPU/IR/attributes.cpp
+index 31f187d80..5e67ed966 100644
+--- a/src/vpux_compiler/src/dialect/VPU/IR/attributes.cpp
++++ b/src/vpux_compiler/src/dialect/VPU/IR/attributes.cpp
+@@ -138,6 +138,26 @@ double vpux::VPU::getDmaBandwidthGBps(vpux::config::ArchKind arch) {
+     return BW;
+ }
+ 
++namespace {
++
++// NPU_RS_CMX_FRAC=F (0 < F <= 1): the CMX size the tiling and placement decisions see is F x the
++// real one; the memory allocator (feasible allocation) still uses all of it. With F ~ 0.5 the ops
++// are tiled so two of them fit in CMX at the same time, which the scheduler needs to run a DPU op
++// and a SHAVE op concurrently. Default 1 = unchanged.
++Byte scaleCMX(Byte size) {
++    static const double frac = [] {
++        const auto* env = std::getenv("NPU_RS_CMX_FRAC");
++        const double f = env != nullptr ? std::atof(env) : 1.0;
++        return (f > 0.0 && f < 1.0) ? f : 1.0;
++    }();
++    if (frac == 1.0) {
++        return size;
++    }
++    return Byte(static_cast<int64_t>(static_cast<double>(size.count()) * frac) / 1024 * 1024);
++}
++
++}  // namespace
++
+ // NOTE: This function is expected to be called only after all CMX memory reservation.
+ Byte vpux::VPU::getTotalCMXSize(mlir::ModuleOp module) {
+     // This function is used to determine the best tile size. It tries to put maximum data in CMX.
+@@ -157,7 +177,7 @@ Byte vpux::VPU::getTotalCMXSize(mlir::ModuleOp module) {
+     auto cmxSize = config::getAvailableMemory(module, VPU::MemoryKind::CMX_NN).size();
+     auto reservedCMXSize = config::getReservedMemorySize(module, cmxSpaceAttr);
+ 
+-    return cmxSize - Byte(reservedCMXSize) - Byte(2 * dynamicProfilingBufferSize);
++    return scaleCMX(cmxSize - Byte(reservedCMXSize) - Byte(2 * dynamicProfilingBufferSize));
+ }
+ 
+ Byte vpux::VPU::getTotalCMXSize(mlir::Operation* op) {
+@@ -182,7 +202,7 @@ Byte vpux::VPU::getTotalCMXFragmentationAwareSize(mlir::ModuleOp module) {
+                                                 : vpux::VPUIP::HW_DPU_PROFILING_MAX_BUFFER_SIZE) +
+             ((arch == config::ArchKind::NPU37XX) ? vpux::VPUIP::HW_ACT_SHAVE_PROFILING_MAX_BUFFER_SIZE : 0);
+ 
+-    return cmxRes.size() - Byte(2 * profilingBufferSize);
++    return scaleCMX(cmxRes.size() - Byte(2 * profilingBufferSize));
+ }
+ 
+ Byte vpux::VPU::getTotalCMXFragmentationAwareSize(mlir::Operation* op) {

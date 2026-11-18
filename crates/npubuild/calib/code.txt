@@ -1,0 +1,1400 @@
+//! Tool use: the Anthropic request/response side, and the model's own format.
+//!
+//! Two formats meet here and neither is negotiable:
+//!
+//! * **Anthropic Messages API**: tools are `{name, description, input_schema}`,
+//!   calls come back as `tool_use` blocks with a JSON `input` object, results
+//!   arrive as `tool_result` blocks.
+//! * **This model's chat template**: tools are rendered into the system turn
+//!   as OpenAI-shaped `{"type":"function","function":{...}}` JSON, and a call is
+//!   *XML-ish text*: `<tool_call><function=name><parameter=k>` with the value on
+//!   its own lines. Not the `{"name":…,"arguments":…}` JSON body older Qwen
+//!   releases used. See `Tokenizer::build_prompt`, which is pinned against the
+//!   template extracted from the GGUF.
+//!
+//! So a call round-trips through text, and the interesting work is turning that
+//! text back into typed JSON without a schema-aware parser: the wire format
+//! carries no types at all. [`ToolSpec::params`] is what supplies them.
+
+use crate::{jstr, Json};
+
+/// One tool the caller declared, ready for both directions.
+pub struct ToolSpec {
+	pub name: String,
+	/// The tool rendered as the template's `tool | tojson`, cached because it
+	/// goes into the prompt on every request of the conversation.
+	pub json: String,
+	/// `(parameter, JSON Schema "type")` for each declared property. This is
+	/// the *only* thing that can tell `"123"` (a string parameter) from `123`
+	/// (a number one) when parsing a call back out of the model's text.
+	pub params: Vec<(String, String)>,
+}
+
+/// What the caller asked for in `tool_choice`.
+#[derive(PartialEq, Debug)]
+pub enum Choice {
+	/// The model decides (the default).
+	Auto,
+	/// It must call something.
+	Any,
+	/// It must call this one.
+	Named(String),
+	/// Tools are declared but must not be called.
+	None,
+}
+
+/// Read `tools` out of a request.
+///
+/// Anthropic's `input_schema` becomes the template's `function.parameters`; the
+/// wrapper is what the model was trained to read. A tool without a name is
+/// dropped rather than rendered as `"name": null`, which the model would
+/// cheerfully try to call.
+pub fn specs_from_request(req: &Json) -> Vec<ToolSpec> {
+	let Some(arr) = req.get("tools").and_then(|v| v.as_array()) else {
+		return Vec::new();
+	};
+	let mut out = Vec::new();
+	for t in arr {
+		let Some(name) = t.get("name").and_then(|v| v.as_str()) else {
+			continue;
+		};
+		// Anthropic ships server-side tool types (web_search and friends) in the
+		// same array, marked by `type` and carrying no input_schema. We cannot
+		// run those, and offering them to the model would produce calls nothing
+		// can answer.
+		let schema = t.get("input_schema");
+		if schema.is_none() && t.get("type").is_some() {
+			continue;
+		}
+		let mut func: Vec<(String, Json)> = vec![("name".to_string(), Json::Str(name.to_string()))];
+		if let Some(d) = t.get("description").and_then(|v| v.as_str()) {
+			func.push(("description".to_string(), Json::Str(d.to_string())));
+		}
+		let mut params = Vec::new();
+		if let Some(schema) = schema {
+			if let Some(Json::Obj(props)) = schema.get("properties") {
+				for (k, v) in props {
+					let ty = v
+						.get("type")
+						.and_then(|t| t.as_str())
+						.map(|s| s.to_string())
+						// A property with no `type` is legal JSON Schema
+						// (`enum`, `anyOf`, `$ref`). "" means "guess from the
+						// text" in `coerce`.
+						.unwrap_or_default();
+					params.push((k.clone(), ty));
+				}
+			}
+			func.push(("parameters".to_string(), schema.clone()));
+		}
+		let wrapped = Json::Obj(vec![
+			("type".to_string(), Json::Str("function".to_string())),
+			("function".to_string(), Json::Obj(func)),
+		]);
+		out.push(ToolSpec {
+			name: name.to_string(),
+			json: wrapped.to_string_spaced(),
+			params,
+		});
+	}
+	out
+}
+
+/// Read `tool_choice`. Anything unrecognized is `Auto`, which is the API default
+/// and the only safe way to be wrong.
+pub fn choice_from_request(req: &Json) -> Choice {
+	let Some(tc) = req.get("tool_choice") else {
+		return Choice::Auto;
+	};
+	match tc.get("type").and_then(|v| v.as_str()) {
+		Some("any") => Choice::Any,
+		Some("none") => Choice::None,
+		Some("tool") => match tc.get("name").and_then(|v| v.as_str()) {
+			Some(n) => Choice::Named(n.to_string()),
+			None => Choice::Auto,
+		},
+		_ => Choice::Auto,
+	}
+}
+
+/// Text to seed the assistant turn with so a forced choice is actually forced.
+///
+/// `tool_choice` cannot be honored by asking nicely: a model told "you must
+/// call a function" still sometimes answers in prose. Opening the call for it
+/// makes the constraint structural: with `<tool_call>\n` already in the context
+/// the only continuation the format allows is a function name. `Named` goes one
+/// token further and writes the name too, so "call *this*" cannot be missed.
+pub fn forced_prefix(choice: &Choice) -> String {
+	match choice {
+		Choice::Any => "<tool_call>\n".to_string(),
+		Choice::Named(n) => format!("<tool_call>\n<function={n}>\n"),
+		_ => String::new(),
+	}
+}
+
+// ===========================================================================
+// Parsing the model's output
+// ===========================================================================
+
+/// A call recovered from the model's text.
+pub struct ParsedCall {
+	pub name: String,
+	/// Always a `Json::Obj`.
+	pub input: Json,
+}
+
+impl ParsedCall {
+	pub fn input_json(&self) -> String {
+		self.input.to_string()
+	}
+}
+
+/// Parse the inside of one `<tool_call>…</tool_call>` block.
+///
+/// Lenient about the closing tags and strict about the opening ones: a call
+/// truncated by `max_tokens` still names a function and may carry complete
+/// parameters, and dropping all of that on a missing `</function>` turns a
+/// recoverable turn into a confusing empty one. A *missing* `<function=` is
+/// different: there is nothing to call.
+pub fn parse_call(raw: &str, tools: &[ToolSpec]) -> Option<ParsedCall> {
+	let i = raw.find("<function=")?;
+	let rest = &raw[i + "<function=".len()..];
+	let j = rest.find('>')?;
+	let name = rest[..j].trim().to_string();
+	if name.is_empty() {
+		return None;
+	}
+	let body = &rest[j + 1..];
+	let spec = tools.iter().find(|t| t.name == name);
+
+	let mut fields: Vec<(String, Json)> = Vec::new();
+	let mut cur = body;
+	while let Some(p) = cur.find("<parameter=") {
+		// A `<parameter=` after `</function>` belongs to a later call, not this
+		// one; stop at the boundary when there is one.
+		if let Some(e) = cur.find("</function>") {
+			if e < p {
+				break;
+			}
+		}
+		let after = &cur[p + "<parameter=".len()..];
+		let Some(q) = after.find('>') else { break };
+		let key = after[..q].trim().to_string();
+		let val_start = &after[q + 1..];
+		// An unterminated value is the truncation case: take the rest.
+		let (val, next) = match val_start.find("</parameter>") {
+			Some(e) => (&val_start[..e], &val_start[e + "</parameter>".len()..]),
+			None => (val_start, ""),
+		};
+		// The template writes a newline after the tag and before the closer;
+		// they are framing, not part of the value.
+		let val = val.strip_prefix('\n').unwrap_or(val);
+		let val = val.strip_suffix('\n').unwrap_or(val);
+		let ty = spec
+			.and_then(|s| s.params.iter().find(|(k, _)| *k == key))
+			.map(|(_, t)| t.as_str())
+			.unwrap_or("");
+		fields.push((key, coerce(val, ty)));
+		if next.is_empty() {
+			break;
+		}
+		cur = next;
+	}
+	Some(ParsedCall {
+		name,
+		input: Json::Obj(fields),
+	})
+}
+
+/// Turn a parameter's raw text back into a typed JSON value.
+///
+/// The declared type wins whenever there is one, and that direction matters
+/// more than it looks: a `"string"` parameter whose value happens to be `123`
+/// or `true` must stay text, or a shell command like `0` becomes the number
+/// zero and the tool receives the wrong type. With no declared type the text is
+/// tried as JSON and kept as a string if that fails, which is the same rule the
+/// template used when it wrote the value out.
+fn coerce(text: &str, ty: &str) -> Json {
+	match ty {
+		"string" => Json::Str(text.to_string()),
+		"" => Json::parse(text.trim().as_bytes()).unwrap_or_else(|_| Json::Str(text.to_string())),
+		_ => match Json::parse(text.trim().as_bytes()) {
+			// A malformed number or object is still better delivered as the
+			// text the model wrote than dropped: the tool can say so.
+			Ok(v) => v,
+			Err(_) => Json::Str(text.to_string()),
+		},
+	}
+}
+
+// ===========================================================================
+// Splitting the output stream
+// ===========================================================================
+
+#[derive(PartialEq)]
+enum Mode {
+	Text,
+	Think,
+	Call,
+}
+
+/// Separates visible text from `<tool_call>` blocks (and stray `<think>` ones)
+/// as tokens arrive.
+///
+/// The hard part is streaming: `<tool_call>` arrives one token at a time, and by
+/// the time the tag is recognizable its first characters have already been
+/// eligible to send. So text is emitted only up to the longest suffix that could
+/// still be the start of a marker: `"<to"` is held, `"<x"` is not. Without that
+/// the client sees the literal `<tool_call>` XML in the assistant's prose before
+/// the tool block replaces it.
+pub struct OutputSplitter {
+	buf: String,
+	mode: Mode,
+	/// Raw bodies of the tool-call blocks seen so far.
+	pub calls: Vec<String>,
+	/// Reasoning that became safe to send since the last [`Self::take_think`]:
+	/// a think block's body without the whitespace that touches its tags.
+	think: String,
+	/// Whether the current think block has produced a non-space yet.
+	think_started: bool,
+}
+
+/// Markers that end plain text. With thinking off `<think>` is a safety net:
+/// the server closes the thinking block in the prompt, so the model should
+/// never open another, but a leaked `<think>` rendered as assistant prose is a
+/// bad failure mode for a caller that parses the reply.
+const OPENERS: [&str; 2] = ["<tool_call>", "<think>"];
+
+impl Default for OutputSplitter {
+	fn default() -> Self {
+		OutputSplitter {
+			buf: String::new(),
+			mode: Mode::Text,
+			calls: Vec::new(),
+			think: String::new(),
+			think_started: false,
+		}
+	}
+}
+
+impl OutputSplitter {
+	pub fn new() -> OutputSplitter {
+		Self::default()
+	}
+
+	/// A splitter for a reply that starts inside a think block: the prompt
+	/// ended on the template's open `<think>\n`.
+	pub fn thinking() -> OutputSplitter {
+		OutputSplitter {
+			mode: Mode::Think,
+			..Self::default()
+		}
+	}
+
+	/// Whether the stream is inside a think block.
+	pub fn in_think(&self) -> bool {
+		self.mode == Mode::Think
+	}
+
+	/// The reasoning that is safe to send since the last call.
+	pub fn take_think(&mut self) -> String {
+		std::mem::take(&mut self.think)
+	}
+
+	/// Pass on `body` (think-block text) as reasoning: leading whitespace of
+	/// the block dropped, trailing whitespace only once more text follows it.
+	fn think_text(&mut self, body: &str, last: bool) {
+		let body = if self.think_started {
+			body
+		} else {
+			body.trim_start()
+		};
+		let body = if last { body.trim_end() } else { body };
+		if !body.is_empty() {
+			self.think_started = true;
+			self.think.push_str(body);
+		}
+	}
+
+	/// Feed decoded text; returns whatever is now safe to send to the client.
+	pub fn push(&mut self, piece: &str) -> String {
+		self.buf.push_str(piece);
+		let mut out = String::new();
+		loop {
+			match self.mode {
+				Mode::Text => {
+					if let Some((i, m)) = earliest(&self.buf, &OPENERS) {
+						out.push_str(&self.buf[..i]);
+						self.buf.drain(..i + m.len());
+						self.mode = if m == "<tool_call>" {
+							Mode::Call
+						} else {
+							Mode::Think
+						};
+						continue;
+					}
+					let keep = held_back(&self.buf, &OPENERS);
+					let n = self.buf.len() - keep;
+					out.push_str(&self.buf[..n]);
+					self.buf.drain(..n);
+					break;
+				}
+				Mode::Call => match self.buf.find("</tool_call>") {
+					Some(i) => {
+						self.calls.push(self.buf[..i].to_string());
+						self.buf.drain(..i + "</tool_call>".len());
+						self.mode = Mode::Text;
+					}
+					None => break,
+				},
+				Mode::Think => match self.buf.find("</think>") {
+					Some(i) => {
+						let body: String = self.buf.drain(..i + "</think>".len()).collect();
+						self.think_text(&body[..i], true);
+						self.think_started = false;
+						self.mode = Mode::Text;
+					}
+					None => {
+						// Up to a possible partial `</think>`, and short of the
+						// trailing whitespace, which may be the block's last.
+						let keep = held_back(&self.buf, &["</think>"]);
+						let n = self.buf[..self.buf.len() - keep].trim_end().len();
+						let body: String = self.buf.drain(..n).collect();
+						self.think_text(&body, false);
+						break;
+					}
+				},
+			}
+		}
+		out
+	}
+
+	/// End of generation: flush what is left.
+	///
+	/// A held-back partial marker was never a marker after all, so it is text. A
+	/// tool call cut off by `max_tokens` is kept ([`parse_call`] recovers what
+	/// it can) and an unterminated `<think>` (the reply ran out inside its
+	/// reasoning) ends as reasoning: [`Self::take_think`] has the rest.
+	pub fn finish(&mut self) -> String {
+		let tail = std::mem::take(&mut self.buf);
+		match self.mode {
+			Mode::Text => tail,
+			Mode::Call => {
+				if !tail.trim().is_empty() {
+					self.calls.push(tail);
+				}
+				String::new()
+			}
+			Mode::Think => {
+				self.think_text(&tail, true);
+				String::new()
+			}
+		}
+	}
+}
+
+/// Earliest occurrence of any marker, and which one.
+fn earliest<'a>(hay: &str, marks: &[&'a str]) -> Option<(usize, &'a str)> {
+	marks
+		.iter()
+		.filter_map(|m| hay.find(m).map(|i| (i, *m)))
+		.min_by_key(|(i, _)| *i)
+}
+
+/// Length of the trailing run that could still grow into one of `marks`.
+fn held_back(hay: &str, marks: &[&str]) -> usize {
+	let max = marks.iter().map(|m| m.len()).max().unwrap_or(0);
+	let start = hay.len().saturating_sub(max - 1);
+	for i in start..hay.len() {
+		// Marker text is ASCII, so any boundary a marker could start on is a
+		// char boundary; skip the rest rather than panicking on a slice.
+		if !hay.is_char_boundary(i) {
+			continue;
+		}
+		let tail = &hay[i..];
+		if marks.iter().any(|m| m.starts_with(tail)) {
+			return hay.len() - i;
+		}
+	}
+	0
+}
+
+/// `tool_use` block id. Anthropic's are `toolu_`-prefixed and opaque; the client
+/// only has to match the one it echoes back in `tool_result`.
+pub fn new_tool_id(seq: usize) -> String {
+	let t = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_nanos() as u64)
+		.unwrap_or(0);
+	format!(
+		"toolu_{:016x}{:04x}",
+		t ^ 0x9e37_79b9_7f4a_7c15,
+		seq & 0xffff
+	)
+}
+
+/// Render one `tool_use` content block.
+pub fn tool_use_block(id: &str, call: &ParsedCall) -> String {
+	format!(
+		"{{\"type\":\"tool_use\",\"id\":{id},\"name\":{name},\"input\":{input}}}",
+		id = jstr(id),
+		name = jstr(&call.name),
+		input = call.input_json(),
+	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn tools() -> Vec<ToolSpec> {
+		vec![ToolSpec {
+			name: "Bash".to_string(),
+			json: String::new(),
+			params: vec![
+				("command".to_string(), "string".to_string()),
+				("timeout".to_string(), "integer".to_string()),
+				("bg".to_string(), "boolean".to_string()),
+			],
+		}]
+	}
+
+	#[test]
+	fn parses_a_call_and_types_its_arguments_from_the_schema() {
+		let raw = "\n<function=Bash>\n<parameter=command>\nls -la\n</parameter>\n\
+                   <parameter=timeout>\n5000\n</parameter>\n\
+                   <parameter=bg>\ntrue\n</parameter>\n</function>\n";
+		let c = parse_call(raw, &tools()).unwrap();
+		assert_eq!(c.name, "Bash");
+		assert_eq!(
+			c.input_json(),
+			r#"{"command":"ls -la","timeout":5000,"bg":true}"#
+		);
+	}
+
+	/// The case the schema exists to settle: a string parameter whose text is a
+	/// valid number or boolean must not become one. `git checkout 123` and
+	/// `git checkout "123"` are different commands.
+	#[test]
+	fn a_string_parameter_stays_a_string() {
+		let raw = "<function=Bash>\n<parameter=command>\n123\n</parameter>\n</function>";
+		let c = parse_call(raw, &tools()).unwrap();
+		assert_eq!(c.input_json(), r#"{"command":"123"}"#);
+	}
+
+	/// Values may span lines; only the template's own framing newlines come off.
+	#[test]
+	fn multi_line_values_keep_their_interior_newlines() {
+		let raw = "<function=Bash>\n<parameter=command>\nline one\n\nline three\n</parameter>\n</function>";
+		let c = parse_call(raw, &tools()).unwrap();
+		assert_eq!(c.input_json(), r#"{"command":"line one\n\nline three"}"#);
+	}
+
+	/// An unknown tool has no schema, so values are read as JSON when they look
+	/// like it and as text otherwise.
+	#[test]
+	fn an_undeclared_tool_falls_back_to_guessing() {
+		let raw = "<function=Other>\n<parameter=n>\n7\n</parameter>\n\
+                   <parameter=s>\nhello\n</parameter>\n</function>";
+		let c = parse_call(raw, &tools()).unwrap();
+		assert_eq!(c.name, "Other");
+		assert_eq!(c.input_json(), r#"{"n":7,"s":"hello"}"#);
+	}
+
+	/// `max_tokens` in the middle of a call: keep the name and whatever
+	/// parameters completed, rather than returning nothing.
+	#[test]
+	fn a_truncated_call_keeps_what_it_has() {
+		let raw = "<function=Bash>\n<parameter=command>\nls\n</parameter>\n<parameter=timeout>\n50";
+		let c = parse_call(raw, &tools()).unwrap();
+		assert_eq!(c.input_json(), r#"{"command":"ls","timeout":50}"#);
+	}
+
+	#[test]
+	fn a_block_with_no_function_is_not_a_call() {
+		assert!(parse_call("\nnonsense\n", &tools()).is_none());
+	}
+
+	#[test]
+	fn splitter_separates_prose_from_a_call() {
+		let mut s = OutputSplitter::new();
+		let mut out = String::new();
+		out.push_str(&s.push("I will run it.\n\n<tool_call>\n<function=Bash>\n"));
+		out.push_str(&s.push("<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"));
+		out.push_str(&s.finish());
+		assert_eq!(out, "I will run it.\n\n");
+		assert_eq!(s.calls.len(), 1);
+		assert_eq!(
+			parse_call(&s.calls[0], &tools()).unwrap().input_json(),
+			r#"{"command":"ls"}"#
+		);
+	}
+
+	/// The streaming hazard: a marker split across token boundaries must never
+	/// be forwarded as text, however finely it is cut.
+	#[test]
+	fn splitter_never_leaks_a_marker_split_across_pieces() {
+		for chunk in 1..=4 {
+			let src = "ok<tool_call>\n<function=Bash>\n</function>\n</tool_call>tail";
+			let mut s = OutputSplitter::new();
+			let mut out = String::new();
+			let bytes: Vec<char> = src.chars().collect();
+			for piece in bytes.chunks(chunk) {
+				out.push_str(&s.push(&piece.iter().collect::<String>()));
+			}
+			out.push_str(&s.finish());
+			assert_eq!(out, "oktail", "chunk size {chunk}");
+			assert_eq!(s.calls.len(), 1, "chunk size {chunk}");
+		}
+	}
+
+	/// A `<` that never becomes a marker is ordinary text and must still come
+	/// out: held back briefly, not swallowed.
+	#[test]
+	fn splitter_releases_a_false_start() {
+		let mut s = OutputSplitter::new();
+		let mut out = String::new();
+		out.push_str(&s.push("a < b and <to"));
+		out.push_str(&s.push("m is 3"));
+		out.push_str(&s.finish());
+		assert_eq!(out, "a < b and <tom is 3");
+		assert!(s.calls.is_empty());
+	}
+
+	#[test]
+	fn splitter_drops_a_thinking_block() {
+		let mut s = OutputSplitter::new();
+		let mut out = String::new();
+		out.push_str(&s.push("<think>\nhmm\n</think>\n\nthe answer"));
+		out.push_str(&s.finish());
+		assert_eq!(out, "\n\nthe answer");
+	}
+
+	/// A reply that starts inside the prompt's open `<think>\n`: the reasoning
+	/// comes out through `take_think` without the whitespace around it, at any
+	/// chunking, and a reply cut off inside it still yields what it had.
+	#[test]
+	fn splitter_streams_reasoning() {
+		let raw = "First, add.\n\n2 + 2 = 4\n</think>\n\nIt is 4.<tool_call>\n<function=A>\n</function>\n</tool_call>";
+		for chunk in [1, 2, 3, 7, raw.len()] {
+			let mut s = OutputSplitter::thinking();
+			let (mut think, mut out) = (String::new(), String::new());
+			for c in raw.as_bytes().chunks(chunk) {
+				out.push_str(&s.push(std::str::from_utf8(c).unwrap()));
+				think.push_str(&s.take_think());
+			}
+			out.push_str(&s.finish());
+			think.push_str(&s.take_think());
+			assert_eq!(think, "First, add.\n\n2 + 2 = 4", "chunk size {chunk}");
+			assert_eq!(out, "\n\nIt is 4.", "chunk size {chunk}");
+			assert_eq!(s.calls.len(), 1, "chunk size {chunk}");
+		}
+		let mut s = OutputSplitter::thinking();
+		assert_eq!(s.push("\nhalf a thought \n"), "");
+		assert!(s.in_think());
+		s.finish();
+		assert_eq!(s.take_think(), "half a thought");
+	}
+
+	#[test]
+	fn splitter_handles_two_calls_in_one_turn() {
+		let mut s = OutputSplitter::new();
+		s.push("<tool_call>\n<function=A>\n</function>\n</tool_call>\n");
+		s.push("<tool_call>\n<function=B>\n</function>\n</tool_call>");
+		s.finish();
+		assert_eq!(s.calls.len(), 2);
+		assert_eq!(parse_call(&s.calls[1], &[]).unwrap().name, "B");
+	}
+
+	#[test]
+	fn specs_convert_anthropic_tools_to_the_template_shape() {
+		let req = Json::parse(
+			br#"{"tools":[{"name":"Read","description":"d","input_schema":{"type":"object","properties":{"p":{"type":"string"}}}}]}"#,
+		)
+		.unwrap();
+		let s = specs_from_request(&req);
+		assert_eq!(s.len(), 1);
+		assert_eq!(s[0].name, "Read");
+		assert_eq!(s[0].params, vec![("p".to_string(), "string".to_string())]);
+		assert_eq!(
+			s[0].json,
+			r#"{"type": "function", "function": {"name": "Read", "description": "d", "parameters": {"type": "object", "properties": {"p": {"type": "string"}}}}}"#
+		);
+	}
+
+	/// Server-side tool types (`web_search` and friends) carry no schema and
+	/// nothing here can run them; offering them would produce calls the client
+	/// never asked to handle.
+	#[test]
+	fn specs_skip_server_side_tools() {
+		let req = Json::parse(br#"{"tools":[{"type":"web_search_20250305","name":"web_search"}]}"#)
+			.unwrap();
+		assert!(specs_from_request(&req).is_empty());
+	}
+
+	#[test]
+	fn tool_choice_is_read_and_forced_structurally() {
+		let any = Json::parse(br#"{"tool_choice":{"type":"any"}}"#).unwrap();
+		assert_eq!(choice_from_request(&any), Choice::Any);
+		assert_eq!(forced_prefix(&Choice::Any), "<tool_call>\n");
+		let named = Json::parse(br#"{"tool_choice":{"type":"tool","name":"Bash"}}"#).unwrap();
+		assert_eq!(
+			choice_from_request(&named),
+			Choice::Named("Bash".to_string())
+		);
+		assert_eq!(
+			forced_prefix(&Choice::Named("Bash".into())),
+			"<tool_call>\n<function=Bash>\n"
+		);
+		assert_eq!(choice_from_request(&Json::Obj(vec![])), Choice::Auto);
+		assert_eq!(forced_prefix(&Choice::Auto), "");
+	}
+}
+//! OpenAI Chat Completions (`POST /v1/chat/completions`) and the llama.cpp
+//! `llama-server` discovery routes (`GET /props`, the `meta` of `/v1/models`).
+//!
+//! This is what Zed's **llama.cpp** provider speaks: it lists `/v1/models`,
+//! reads the context window, vision and tool support from `/props`, and streams
+//! `/v1/chat/completions` with `stream_options.include_usage`. Zed's own client
+//! (`crates/llama_cpp` and `language_models/src/provider/llama_cpp.rs` in the
+//! Zed tree) is the reference for which fields matter.
+//!
+//! A request is translated into the Anthropic-shaped request `generate` already
+//! takes, so the prompt, tool-call format and prefix cache are shared with
+//! `/v1/messages` and the two APIs cannot drift apart. Only the response is
+//! formatted here ([`OpenAiWire`]).
+
+use std::io::Write;
+
+use crate::tools::{self, ParsedCall};
+use crate::{jstr, respond_json, sse_begin, sse_chunk, sse_end, Json, Loaded, Stop, Usage, Wire};
+
+fn obj(kv: Vec<(&str, Json)>) -> Json {
+	Json::Obj(kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+fn s(v: &str) -> Json {
+	Json::Str(v.to_string())
+}
+
+/// Translate a Chat Completions request into the Messages API shape.
+///
+/// * `system` / `developer` messages, wherever they are, become the top-level
+///   `system` (the chat template has one system turn, at the start).
+/// * `image_url` parts become `image` blocks; `blocks_of` already accepts a
+///   `data:` URL as the source and refuses remote ones.
+/// * An assistant's `tool_calls` become `tool_use` blocks, with `arguments`
+///   (a JSON *string* here) parsed back into the object `input` is.
+/// * A `tool` message becomes a user `tool_result`; runs of them merge into one
+///   `<tool_response>` run in the template, as Anthropic's do.
+/// * `tools`' `function.parameters` becomes `input_schema`, `tool_choice`
+///   `required` becomes `any`, and `stop` / `max_completion_tokens` /
+///   `repeat_penalty` map onto their Messages names.
+pub fn to_messages_request(req: &Json) -> Result<Json, String> {
+	let mut out: Vec<(&str, Json)> = Vec::new();
+	let mut system: Vec<String> = Vec::new();
+	let mut messages: Vec<Json> = Vec::new();
+
+	let msgs = req
+		.get("messages")
+		.and_then(|v| v.as_array())
+		.ok_or("`messages` must be an array")?;
+	for m in msgs {
+		let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+		let content = m.get("content");
+		match role {
+			"system" | "developer" => {
+				if let Some(t) = crate::text_of(content) {
+					system.push(t);
+				}
+			}
+			"tool" => {
+				let mut r = vec![
+					("type", s("tool_result")),
+					("content", tool_content(content)?),
+				];
+				if let Some(id) = m.get("tool_call_id").and_then(|v| v.as_str()) {
+					r.push(("tool_use_id", s(id)));
+				}
+				messages.push(obj(vec![
+					("role", s("user")),
+					("content", Json::Arr(vec![obj(r)])),
+				]));
+			}
+			"assistant" => {
+				let mut blocks = Vec::new();
+				// llama-server's and vLLM's names for a turn's reasoning; it is
+				// replayed in the turn's `<think>` (`preserve_thinking`).
+				if let Some(r) = m
+					.get("reasoning_content")
+					.or_else(|| m.get("reasoning"))
+					.and_then(|v| v.as_str())
+					.filter(|r| !r.trim().is_empty())
+				{
+					blocks.push(obj(vec![("type", s("thinking")), ("thinking", s(r))]));
+				}
+				blocks.extend(parts(content)?);
+				for c in m
+					.get("tool_calls")
+					.and_then(|v| v.as_array())
+					.unwrap_or(&[])
+				{
+					let f = c.get("function").ok_or("tool call has no `function`")?;
+					let name = f
+						.get("name")
+						.and_then(|v| v.as_str())
+						.ok_or("tool call has no name")?;
+					// `arguments` is a string of JSON. One that does not parse
+					// (a client replaying a call the model cut off) is replayed
+					// with no arguments rather than failing the conversation.
+					let input = match f.get("arguments") {
+						Some(Json::Str(a)) if !a.trim().is_empty() => {
+							Json::parse(a.as_bytes()).unwrap_or(Json::Obj(Vec::new()))
+						}
+						Some(o @ Json::Obj(_)) => o.clone(),
+						_ => Json::Obj(Vec::new()),
+					};
+					let mut b = vec![("type", s("tool_use")), ("name", s(name)), ("input", input)];
+					if let Some(id) = c.get("id").and_then(|v| v.as_str()) {
+						b.push(("id", s(id)));
+					}
+					blocks.push(obj(b));
+				}
+				messages.push(obj(vec![
+					("role", s("assistant")),
+					("content", Json::Arr(blocks)),
+				]));
+			}
+			_ => messages.push(obj(vec![
+				("role", s("user")),
+				("content", Json::Arr(parts(content)?)),
+			])),
+		}
+	}
+	if !system.is_empty() {
+		out.push(("system", s(&system.join("\n\n"))));
+	}
+	out.push(("messages", Json::Arr(messages)));
+
+	if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
+		let mut ts = Vec::new();
+		for t in tools {
+			// `{"type":"function","function":{...}}`; anything else is not a
+			// tool this server can offer the model.
+			let Some(f) = t.get("function") else { continue };
+			let Some(name) = f.get("name").and_then(|v| v.as_str()) else {
+				continue;
+			};
+			let mut d = vec![("name", s(name))];
+			if let Some(desc) = f.get("description").and_then(|v| v.as_str()) {
+				d.push(("description", s(desc)));
+			}
+			d.push((
+				"input_schema",
+				f.get("parameters")
+					.cloned()
+					.unwrap_or_else(|| obj(vec![("type", s("object"))])),
+			));
+			ts.push(obj(d));
+		}
+		out.push(("tools", Json::Arr(ts)));
+	}
+	match req.get("tool_choice") {
+		Some(Json::Str(c)) => {
+			let ty = match c.as_str() {
+				"required" => "any",
+				"none" => "none",
+				_ => "auto",
+			};
+			out.push(("tool_choice", obj(vec![("type", s(ty))])));
+		}
+		Some(c) => {
+			if let Some(n) = c
+				.get("function")
+				.and_then(|f| f.get("name"))
+				.and_then(|v| v.as_str())
+			{
+				out.push((
+					"tool_choice",
+					obj(vec![("type", s("tool")), ("name", s(n))]),
+				));
+			}
+		}
+		None => {}
+	}
+
+	let max = req
+		.get("max_completion_tokens")
+		.or_else(|| req.get("max_tokens"));
+	if let Some(n) = max.and_then(|v| v.as_f64()).filter(|&n| n > 0.0) {
+		out.push(("max_tokens", Json::Num(n)));
+	}
+	match req.get("stop") {
+		Some(Json::Str(x)) => out.push(("stop_sequences", Json::Arr(vec![s(x)]))),
+		Some(a @ Json::Arr(_)) => out.push(("stop_sequences", a.clone())),
+		_ => {}
+	}
+	for (from, to) in [
+		("temperature", "temperature"),
+		("top_p", "top_p"),
+		("top_k", "top_k"),
+		("min_p", "min_p"),
+		("presence_penalty", "presence_penalty"),
+		("frequency_penalty", "frequency_penalty"),
+		("seed", "seed"),
+		("repetition_penalty", "repetition_penalty"),
+		("repeat_penalty", "repetition_penalty"),
+	] {
+		if let Some(v @ Json::Num(_)) = req.get(from) {
+			out.push((to, v.clone()));
+		}
+	}
+	// The model card's switches: `chat_template_kwargs.enable_thinking`
+	// (Qwen Cloud: top level), OpenAI's `reasoning_effort` (any level but
+	// `none` turns thinking on; `minimal` is the template's `low`), and
+	// `preserve_thinking`. Unset, thinking is on at the template's default
+	// effort, as llama-server renders it (Zed's llama.cpp provider sends no
+	// switch at all and relies on that default) unless the server was
+	// started with `--think` / `--no-preserve-thinking`, whose default then
+	// applies (`thinking_from_request`).
+	let kw = req.get("chat_template_kwargs");
+	let enable = kw
+		.and_then(|k| k.get("enable_thinking"))
+		.or_else(|| req.get("enable_thinking"))
+		.and_then(|v| v.as_bool());
+	let effort = req
+		.get("reasoning_effort")
+		.or_else(|| kw.and_then(|k| k.get("reasoning_effort")))
+		.and_then(|v| v.as_str());
+	let on = match (enable, effort) {
+		(Some(false), _) | (_, Some("none")) => Some(false),
+		(Some(true), _) | (_, Some(_)) => Some(true),
+		(None, None) => (!crate::default_thinking_set()).then_some(true),
+	};
+	if let Some(on) = on {
+		let ty = if on { "enabled" } else { "disabled" };
+		out.push(("thinking", obj(vec![("type", s(ty))])));
+	}
+	if let Some(e) = effort.filter(|&e| e != "none") {
+		let e = if e == "minimal" { "low" } else { e };
+		out.push(("reasoning_effort", s(e)));
+	}
+	if let Some(p) = req
+		.get("preserve_thinking")
+		.or_else(|| kw.and_then(|k| k.get("preserve_thinking")))
+		.and_then(|v| v.as_bool())
+	{
+		out.push(("preserve_thinking", Json::Bool(p)));
+	}
+	Ok(obj(out))
+}
+
+/// A message's `content` (string, parts, or null) as Messages API blocks.
+/// A `tool` message's `content` as a `tool_result`'s: a string as is, the
+/// `image_url` parts of an array as `image` blocks (an agent's `read_file`
+/// on a picture), every other part as it came.
+fn tool_content(content: Option<&Json>) -> Result<Json, String> {
+	match content {
+		Some(Json::Arr(a)) => a
+			.iter()
+			.map(|p| match p.get("type").and_then(|v| v.as_str()) {
+				Some("image_url") => Ok(parts(Some(&Json::Arr(vec![p.clone()])))?.remove(0)),
+				_ => Ok(p.clone()),
+			})
+			.collect::<Result<Vec<_>, String>>()
+			.map(Json::Arr),
+		Some(c) => Ok(c.clone()),
+		None => Ok(Json::Str(String::new())),
+	}
+}
+
+fn parts(content: Option<&Json>) -> Result<Vec<Json>, String> {
+	match content {
+		None | Some(Json::Null) => Ok(Vec::new()),
+		Some(Json::Str(t)) => Ok(vec![obj(vec![("type", s("text")), ("text", s(t))])]),
+		Some(Json::Arr(a)) => {
+			let mut out = Vec::new();
+			for p in a {
+				match p.get("type").and_then(|v| v.as_str()) {
+					Some("text") => {
+						if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+							out.push(obj(vec![("type", s("text")), ("text", s(t))]));
+						}
+					}
+					Some("image_url") => {
+						// `{"url": ...}`, or the bare string some clients send.
+						let iu = p
+							.get("image_url")
+							.ok_or("image_url part has no image_url")?;
+						let url = iu
+							.as_str()
+							.or_else(|| iu.get("url").and_then(|v| v.as_str()))
+							.ok_or("image_url has no url")?;
+						out.push(obj(vec![
+							("type", s("image")),
+							("source", obj(vec![("type", s("base64")), ("data", s(url))])),
+						]));
+					}
+					other => return Err(format!("unsupported content part type {other:?}")),
+				}
+			}
+			Ok(out)
+		}
+		Some(_) => Err("`content` must be a string, an array of parts, or null".to_string()),
+	}
+}
+
+/// Chat Completions response, streamed (`chat.completion.chunk` events ending
+/// in `data: [DONE]`) or whole (`chat.completion`).
+pub struct OpenAiWire {
+	pub stream: bool,
+	/// `stream_options.include_usage`: a final chunk with `usage` and no
+	/// choices. Zed asks for it and shows the numbers.
+	pub include_usage: bool,
+	pub id: String,
+	pub model: String,
+	pub created: u64,
+}
+
+impl OpenAiWire {
+	/// `model`: the id reported when the request names none.
+	pub fn new(req: &Json, model: &str) -> OpenAiWire {
+		let c = crate::new_id();
+		OpenAiWire {
+			stream: req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+			include_usage: req
+				.get("stream_options")
+				.and_then(|o| o.get("include_usage"))
+				.and_then(|v| v.as_bool())
+				.unwrap_or(false),
+			id: format!("chatcmpl-{}", c.trim_start_matches("msg_")),
+			model: req
+				.get("model")
+				.and_then(|v| v.as_str())
+				.unwrap_or(model)
+				.to_string(),
+			created: std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|d| d.as_secs())
+				.unwrap_or(0),
+		}
+	}
+
+	/// One `chat.completion.chunk` with a single choice.
+	fn chunk(&self, w: &mut dyn Write, delta: &str, finish: Option<&str>) -> std::io::Result<()> {
+		let fr = finish.map_or("null".to_string(), jstr);
+		let ev = format!(
+			"{{\"id\":{id},\"object\":\"chat.completion.chunk\",\"created\":{cr},\"model\":{m},\"choices\":[{{\"index\":0,\"delta\":{delta},\"finish_reason\":{fr}}}]}}",
+			id = jstr(&self.id),
+			cr = self.created,
+			m = jstr(&self.model),
+		);
+		sse_chunk(w, &format!("data: {ev}\n\n"))
+	}
+}
+
+fn finish_reason(stop: Stop) -> &'static str {
+	match stop {
+		Stop::EndTurn | Stop::StopSequence => "stop",
+		Stop::MaxTokens => "length",
+		Stop::ToolUse => "tool_calls",
+	}
+}
+
+fn usage_json(u: &Usage) -> String {
+	format!(
+		"{{\"prompt_tokens\":{i},\"completion_tokens\":{o},\"total_tokens\":{t},\"prompt_tokens_details\":{{\"cached_tokens\":{c}}}}}",
+		i = u.input,
+		o = u.output,
+		t = u.input + u.output,
+		c = u.cached,
+	)
+}
+
+/// One entry of `tool_calls`; `index` is only part of the streamed form.
+fn tool_call_json(n: usize, c: &ParsedCall, with_index: bool) -> String {
+	format!(
+		"{{{idx}\"id\":{id},\"type\":\"function\",\"function\":{{\"name\":{name},\"arguments\":{args}}}}}",
+		idx = if with_index { format!("\"index\":{n},") } else { String::new() },
+		id = jstr(&tools::new_tool_id(n).replacen("toolu_", "call_", 1)),
+		name = jstr(&c.name),
+		args = jstr(&c.input_json()),
+	)
+}
+
+impl Wire for OpenAiWire {
+	fn start(&mut self, w: &mut dyn Write, _input_tokens: usize) -> std::io::Result<()> {
+		if !self.stream {
+			return Ok(());
+		}
+		sse_begin(w)?;
+		self.chunk(w, "{\"role\":\"assistant\",\"content\":\"\"}", None)
+	}
+
+	fn text(&mut self, w: &mut dyn Write, text: &str) -> std::io::Result<()> {
+		if !self.stream {
+			return Ok(());
+		}
+		self.chunk(w, &format!("{{\"content\":{}}}", jstr(text)), None)
+	}
+
+	/// As llama-server streams it (`reasoning_format: deepseek`), which is
+	/// what Zed and the model card's client read.
+	fn thinking(&mut self, w: &mut dyn Write, text: &str) -> std::io::Result<()> {
+		if !self.stream {
+			return Ok(());
+		}
+		self.chunk(
+			w,
+			&format!("{{\"reasoning_content\":{}}}", jstr(text)),
+			None,
+		)
+	}
+
+	fn finish(
+		&mut self,
+		w: &mut dyn Write,
+		full: &str,
+		thinking: &str,
+		calls: &[ParsedCall],
+		stop: Stop,
+		usage: &Usage,
+	) -> std::io::Result<()> {
+		let fr = finish_reason(stop);
+		if self.stream {
+			// A call is only known once its closing tag has parsed, so each
+			// arrives whole, in one chunk.
+			for (n, c) in calls.iter().enumerate() {
+				self.chunk(
+					w,
+					&format!("{{\"tool_calls\":[{}]}}", tool_call_json(n, c, true)),
+					None,
+				)?;
+			}
+			self.chunk(w, "{}", Some(fr))?;
+			if self.include_usage {
+				let ev = format!(
+					"{{\"id\":{id},\"object\":\"chat.completion.chunk\",\"created\":{cr},\"model\":{m},\"choices\":[],\"usage\":{u}}}",
+					id = jstr(&self.id),
+					cr = self.created,
+					m = jstr(&self.model),
+					u = usage_json(usage),
+				);
+				sse_chunk(w, &format!("data: {ev}\n\n"))?;
+			}
+			sse_chunk(w, "data: [DONE]\n\n")?;
+			return sse_end(w);
+		}
+		let content = if full.is_empty() && !calls.is_empty() {
+			"null".to_string()
+		} else {
+			jstr(full)
+		};
+		let tc = if calls.is_empty() {
+			String::new()
+		} else {
+			let v: Vec<String> = calls
+				.iter()
+				.enumerate()
+				.map(|(n, c)| tool_call_json(n, c, false))
+				.collect();
+			format!(",\"tool_calls\":[{}]", v.join(","))
+		};
+		let rc = if thinking.is_empty() {
+			String::new()
+		} else {
+			format!(",\"reasoning_content\":{}", jstr(thinking))
+		};
+		let body = format!(
+			"{{\"id\":{id},\"object\":\"chat.completion\",\"created\":{cr},\"model\":{m},\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":{content}{rc}{tc}}},\"finish_reason\":{fr}}}],\"usage\":{u}}}",
+			id = jstr(&self.id),
+			cr = self.created,
+			m = jstr(&self.model),
+			fr = jstr(fr),
+			u = usage_json(usage),
+		);
+		respond_json(w, 200, "OK", &body)
+	}
+}
+
+/// `POST /v1/chat/completions`.
+pub fn handle_chat(w: &mut dyn Write, loaded: &Loaded, req: &Json) -> std::io::Result<()> {
+	let mreq = match to_messages_request(req) {
+		Ok(r) => r,
+		Err(e) => return crate::write_error(w, 400, &e),
+	};
+	let mut wire = OpenAiWire::new(req, loaded.model_id());
+	// No `max_tokens` means "until the model stops", as in llama-server;
+	// `generate` caps it at the end of the context.
+	crate::generate(w, loaded, &mreq, &mut wire, usize::MAX)
+}
+
+/// `GET /props`, the part of llama-server's answer clients read: the context
+/// size, vision, and what the chat template supports. Zed takes its context
+/// window and its tool / image switches for the model from here.
+///
+/// `supports_preserve_reasoning` is true: an assistant message's
+/// `reasoning_content` is replayed into its `<think>` block, as the template
+/// does (`preserve_thinking`).
+pub fn props_json(loaded: &Loaded) -> String {
+	format!(
+		"{{\"default_generation_settings\":{{\"id\":0,\"n_ctx\":{ctx},\"params\":{{}}}},\"total_slots\":1,\"model_alias\":{name},\"model_path\":{name},\"modalities\":{{\"vision\":{vision},\"audio\":false}},\"chat_template_caps\":{{\"supports_tools\":true,\"supports_tool_calls\":true,\"supports_system_role\":true,\"supports_parallel_tool_calls\":true,\"supports_preserve_reasoning\":true}},\"build_info\":\"qwen.rs\"}}",
+		ctx = loaded.ctx(),
+		name = jstr(loaded.model_id()),
+		vision = loaded.vision.is_some() || matches!(&loaded.backend, crate::Backend::Engine { info, .. } if info.image.is_some()),
+	)
+}
+
+/// The `meta` object llama-server puts on its `/v1/models` entry. Zed falls back
+/// to `n_ctx` from it when `/props` is unavailable.
+pub fn model_meta_json(loaded: &Loaded) -> String {
+	let (ctx_train, n_vocab, n_embd) = loaded.dims();
+	format!(
+		"{{\"n_ctx\":{},\"n_ctx_train\":{ctx_train},\"n_vocab\":{n_vocab},\"n_embd\":{n_embd}}}",
+		loaded.ctx()
+	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn tr(j: &str) -> Json {
+		to_messages_request(&Json::parse(j.as_bytes()).unwrap()).unwrap()
+	}
+
+	#[test]
+	fn system_messages_are_hoisted_and_joined() {
+		let r = tr(
+			r#"{"messages":[{"role":"system","content":"A"},{"role":"user","content":"hi"},{"role":"system","content":[{"type":"text","text":"B"}]}]}"#,
+		);
+		assert_eq!(r.get("system").and_then(|v| v.as_str()), Some("A\n\nB"));
+		assert_eq!(r.get("messages").unwrap().as_array().unwrap().len(), 1);
+	}
+
+	#[test]
+	fn tool_round_trip_becomes_tool_use_and_tool_result() {
+		let r = tr(r#"{"messages":[
+            {"role":"user","content":"list"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"ls","arguments":"{\"path\":\"/tmp\",\"n\":3}"}}]},
+            {"role":"tool","tool_call_id":"call_1","content":"a.txt"}
+        ],
+        "tools":[{"type":"function","function":{"name":"ls","description":"List","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],
+        "tool_choice":"required"}"#);
+		let msgs = r.get("messages").unwrap().as_array().unwrap();
+		let call = &msgs[1].get("content").unwrap().as_array().unwrap()[0];
+		assert_eq!(call.get("type").unwrap().as_str(), Some("tool_use"));
+		assert_eq!(
+			call.get("input").unwrap().to_string(),
+			r#"{"path":"/tmp","n":3}"#
+		);
+		let res = &msgs[2].get("content").unwrap().as_array().unwrap()[0];
+		assert_eq!(res.get("type").unwrap().as_str(), Some("tool_result"));
+		assert_eq!(msgs[2].get("role").unwrap().as_str(), Some("user"));
+
+		let specs = tools::specs_from_request(&r);
+		assert_eq!(specs.len(), 1);
+		assert_eq!(
+			specs[0].params,
+			vec![("path".to_string(), "string".to_string())]
+		);
+		assert_eq!(tools::choice_from_request(&r), tools::Choice::Any);
+
+		// And the turns the template sees.
+		let turns = crate::turns_from_request(&r, &mut |_| unreachable!()).unwrap();
+		assert!(matches!(&turns[1], tokenizer::Turn::Assistant { calls, .. } if calls.len() == 1));
+		assert!(
+			matches!(&turns[2], tokenizer::Turn::ToolResults(v) if v == &vec!["a.txt".to_string()])
+		);
+	}
+
+	/// Zed's `read_file` on a picture: a `tool` message whose content holds an
+	/// `image_url` part. It reaches the tool result as an image block.
+	#[test]
+	fn tool_message_image_url_becomes_an_image_block() {
+		let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+		let r = tr(&format!(
+			r#"{{"messages":[
+            {{"role":"user","content":"look"}},
+            {{"role":"assistant","content":null,"tool_calls":[{{"id":"c","type":"function","function":{{"name":"read_file","arguments":"{{}}"}}}}]}},
+            {{"role":"tool","tool_call_id":"c","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{png}"}}}}]}}
+        ]}}"#
+		));
+		let mut n = 0;
+		let turns = crate::turns_from_request(&r, &mut |_| {
+			n += 1;
+			Ok("[img]".to_string())
+		})
+		.unwrap();
+		assert_eq!(n, 1);
+		assert!(
+			matches!(&turns[2], tokenizer::Turn::ToolResults(v) if v == &vec!["[img]".to_string()])
+		);
+	}
+
+	#[test]
+	fn named_tool_choice_stop_and_limits() {
+		let r = tr(
+			r#"{"messages":[{"role":"user","content":"x"}],"tool_choice":{"type":"function","function":{"name":"f"}},"stop":"END","max_completion_tokens":7,"repeat_penalty":1.1,"chat_template_kwargs":{"enable_thinking":true}}"#,
+		);
+		assert_eq!(
+			tools::choice_from_request(&r),
+			tools::Choice::Named("f".to_string())
+		);
+		assert_eq!(r.get("stop_sequences").unwrap().to_string(), r#"["END"]"#);
+		assert_eq!(r.get("max_tokens").and_then(|v| v.as_f64()), Some(7.0));
+		assert_eq!(
+			r.get("repetition_penalty").and_then(|v| v.as_f64()),
+			Some(1.1)
+		);
+		assert_eq!(
+			r.get("thinking").unwrap().to_string(),
+			r#"{"type":"enabled"}"#
+		);
+	}
+
+	#[test]
+	fn thinking_defaults_on_as_in_llama_server() {
+		// Zed's llama.cpp provider sends no thinking switch at all: llama-server
+		// then renders the template's default, thinking on.
+		let r = tr(
+			r#"{"model":"m","messages":[{"role":"user","content":"x"}],"stream":true,"stream_options":{"include_usage":true}}"#,
+		);
+		assert_eq!(
+			r.get("thinking").unwrap().to_string(),
+			r#"{"type":"enabled"}"#
+		);
+		let t = crate::thinking_from_request(&r).unwrap();
+		assert!(t.think.enabled());
+		// An explicit off still wins.
+		let r = tr(r#"{"messages":[{"role":"user","content":"x"}],"reasoning_effort":"none"}"#);
+		assert_eq!(
+			r.get("thinking").unwrap().to_string(),
+			r#"{"type":"disabled"}"#
+		);
+	}
+
+	#[test]
+	fn image_url_part_becomes_an_image_block() {
+		let r = tr(
+			r#"{"messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}"#,
+		);
+		let blocks = r.get("messages").unwrap().as_array().unwrap()[0]
+			.get("content")
+			.unwrap()
+			.as_array()
+			.unwrap()
+			.to_vec();
+		assert_eq!(blocks[1].get("type").unwrap().as_str(), Some("image"));
+		assert_eq!(
+			blocks[1]
+				.get("source")
+				.unwrap()
+				.get("data")
+				.unwrap()
+				.as_str(),
+			Some("data:image/png;base64,AAAA")
+		);
+	}
+
+	fn call() -> ParsedCall {
+		ParsedCall {
+			name: "ls".to_string(),
+			input: Json::parse(br#"{"path":"/tmp"}"#).unwrap(),
+		}
+	}
+
+	#[test]
+	fn streamed_response_shape() {
+		let mut wire = OpenAiWire {
+			stream: true,
+			include_usage: true,
+			id: "chatcmpl-1".to_string(),
+			model: "m".to_string(),
+			created: 0,
+		};
+		let mut out = Vec::new();
+		wire.start(&mut out, 5).unwrap();
+		wire.text(&mut out, "hi \"x\"").unwrap();
+		let u = Usage {
+			input: 5,
+			output: 3,
+			cached: 2,
+		};
+		wire.finish(&mut out, "hi", "", &[call()], Stop::ToolUse, &u)
+			.unwrap();
+		let text = String::from_utf8(out).unwrap();
+		// Every event a client parses is one `data:` line of JSON.
+		let events: Vec<&str> = text
+			.lines()
+			.filter_map(|l| l.strip_prefix("data: "))
+			.collect();
+		assert_eq!(events.last(), Some(&"[DONE]"));
+		for e in &events[..events.len() - 1] {
+			Json::parse(e.as_bytes()).unwrap_or_else(|err| panic!("{err}: {e}"));
+		}
+		let tc = Json::parse(events[2].as_bytes()).unwrap();
+		let f = &tc.get("choices").unwrap().as_array().unwrap()[0]
+			.get("delta")
+			.unwrap()
+			.get("tool_calls")
+			.unwrap()
+			.as_array()
+			.unwrap()[0];
+		assert_eq!(f.get("index").and_then(|v| v.as_f64()), Some(0.0));
+		assert_eq!(
+			f.get("function")
+				.unwrap()
+				.get("arguments")
+				.unwrap()
+				.as_str(),
+			Some(r#"{"path":"/tmp"}"#)
+		);
+		assert!(events[3].contains(r#""finish_reason":"tool_calls""#));
+		assert!(
+			events[4].contains(r#""choices":[]"#) && events[4].contains(r#""cached_tokens":2"#)
+		);
+	}
+
+	#[test]
+	fn whole_response_shape() {
+		let mut wire = OpenAiWire {
+			stream: false,
+			include_usage: false,
+			id: "c".into(),
+			model: "m".into(),
+			created: 0,
+		};
+		let mut out = Vec::new();
+		wire.finish(
+			&mut out,
+			"",
+			"",
+			&[call()],
+			Stop::ToolUse,
+			&Usage {
+				input: 1,
+				output: 2,
+				cached: 0,
+			},
+		)
+		.unwrap();
+		let text = String::from_utf8(out).unwrap();
+		let body = Json::parse(text.split("\r\n\r\n").nth(1).unwrap().as_bytes()).unwrap();
+		let ch = &body.get("choices").unwrap().as_array().unwrap()[0];
+		assert_eq!(
+			ch.get("finish_reason").unwrap().as_str(),
+			Some("tool_calls")
+		);
+		let msg = ch.get("message").unwrap();
+		assert!(matches!(msg.get("content"), Some(Json::Null)));
+		assert_eq!(msg.get("tool_calls").unwrap().as_array().unwrap().len(), 1);
+		assert_eq!(
+			body.get("usage")
+				.unwrap()
+				.get("total_tokens")
+				.and_then(|v| v.as_f64()),
+			Some(3.0)
+		);
+	}
+}

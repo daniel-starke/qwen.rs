@@ -1,0 +1,25 @@
+[package]
+name = "imgio"
+description = "Image decoding and Pillow-compatible resampling for the vision tower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Container decoding, plus the PNG encoder of the image generator (part of
+# the `png` feature). `default-features = false` keeps this to the four
+# formats the vision path accepts: no rayon, no HDR/AVIF/WebP.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "bmp",
+    "pnm",
+] }
+
+[lints]
+workspace = true

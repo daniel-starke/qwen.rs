@@ -1,0 +1,107 @@
+/* T = (I + A)^-1 per BS x BS diagonal block of C x C matrices, A strictly
+ * lower (only j < i is read), by forward substitution in f16, row by row
+ * over MM matrices at once (independent chains); a remainder of fewer than
+ * MM matrices one at a time. T is zero outside the blocks.
+ * Carrier: LogSoftmax over a flattened [C * C] axis (`build_delta.py
+ * --shinv BS`; unused elsewhere in a delta layer, and the compiler never
+ * splits that axis, so every invocation gets whole matrices), contiguous
+ * matrices.
+ *
+ * The rows stay a loop on purpose. With a block's 16 rows as straight-line
+ * code (every term of a row scheduled together, no load latency per step)
+ * the emulator counts half the cycles, and the device is slower, 0.33 against
+ * 0.30 ms: that kernel is 12 KB, and code that is not in the instruction
+ * cache costs ~15 cycles per bundle (`NPU.md` 3.5).
+ *
+ *   shave build trinv.sk log_softmax_3720xx.elf -DBS=16
+ *
+ * (and the same ELF as log_softmax_3720xx_lsu0_wo.elf). */
+#ifndef LC
+#define LC 6
+#endif
+#define C (1 << LC)
+#ifndef BS
+#define BS 16
+#endif
+#ifndef MM
+#define MM 4
+#endif
+#define CC (C * C)
+#define NV (BS / 8)
+_Static_assert(BS >= 8 && (BS & (BS - 1)) == 0 && C % BS == 0, "BS: a power of 2 from 8 that divides C");
+_Static_assert(MM >= 1 && MM * NV <= 8, "MM * BS / 8 accumulators must fit 8 registers");
+
+void controlled_act(const u32 *params) {
+    /* MemRefData records, 0x24 bytes each: the input, then the output */
+    const half *restrict A = (const half *)params[0];
+    half *restrict T = (half *)params[9];
+    u32 rank = params[2];
+    const u32 *dims = (const u32 *)params[3];
+    u32 G = 1;
+    do {
+        G *= *dims;
+        dims++;
+        rank--;
+    } while (rank != 0);
+    G = G >> (2 * LC);
+    const half8 zero = 0.0;
+    /* bytes of a matrix */
+    u32 mat = 2 * CC;
+    /* mm matrices per pass, then the rest one by one */
+    for (int mm = MM; mm > 0; mm = (mm == MM && MM > 1)) {
+        while (G >= mm) {
+            u32 i = 0;
+            do {
+                /* the row's block starts at column j0: d rows of it are done */
+                u32 j0 = i & (0 - BS);
+                u32 d = i - j0;
+                register const half *ap[mm];
+                register const half8 *tp[mm];
+                register half8 a[mm * NV];
+                ap[0] = A + (i << LC) + j0;
+                tp[0] = (const half8 *)(T + j0 * (C + 1));
+                for (int m = 0; m < mm; m++) {
+                    if (m > 0) {
+                        ap[m] = (const half *)((const u8 *)ap[m - 1] + mat);
+                        tp[m] = (const half8 *)((const u8 *)tp[m - 1] + mat);
+                    }
+                    for (int b = 0; b < NV; b++) a[m * NV + b] = zero;
+                }
+                /* a -= A[i][k] * T[k] over k = j0 .. i - 1: row k of T ends in segment k / 8 */
+                for (int s = 0; s < NV; s++) {
+                    if (d > 8 * s) {
+                        u32 c = d - 8 * s;
+                        if (c > 8) c = 8;
+                        do {
+                            for (int m = 0; m < mm; m++) {
+                                half8 x = load_splat(ap[m]);
+                                for (int b = 0; b <= s; b++) a[m * NV + b] -= x * tp[m][b];
+                                ap[m]++;
+                                tp[m] += C / 8;
+                            }
+                            c--;
+                        } while (c != 0);
+                    }
+                }
+                /* row i: zero, the block's columns, 1 on the diagonal (matrix by matrix:
+                   all at once would need a register per address) */
+                u8 *tr = (u8 *)(T + (i << LC));
+                u32 col = (i & (0 - BS)) << 1, dg = i << 1;
+                half one = 1.0;
+                for (int m = 0; m < mm; m++) {
+                    for (int b = 0; b < C / 8; b++) ((half8 *)tr)[b] = zero;
+                    half8 *tj = (half8 *)(tr + col);
+                    for (int b = 0; b < NV; b++) tj[b] = a[m * NV + b];
+                    half *diag = (half *)(tr + dg);
+                    *diag = one;
+                    tr += mat;
+                    barrier();
+                }
+                i++;
+            } while (i != C);
+            A += mm * CC;
+            T += mm * CC;
+            G -= mm;
+        }
+    }
+}

@@ -1,0 +1,246 @@
+diff --git a/src/vpux_compiler/src/NPU37XX/dialect/VPUIP/transforms/pipelines.cpp b/src/vpux_compiler/src/NPU37XX/dialect/VPUIP/transforms/pipelines.cpp
+index 98f0d6c9f..39409faea 100644
+--- a/src/vpux_compiler/src/NPU37XX/dialect/VPUIP/transforms/pipelines.cpp
++++ b/src/vpux_compiler/src/NPU37XX/dialect/VPUIP/transforms/pipelines.cpp
+@@ -138,6 +138,9 @@ void vpux::VPUIP::arch37xx::buildDefaultHWPipeline(mlir::OpPassManager& pm,
+     pm.addPass(VPUIP::createUnrollSwKernelPass(log));
+ 
+     pm.addPass(VPUIP::createUnrollDistributedOpsPass(log));
++    // grouped NCE MatMuls (enable-grouped-matmul) -> one 4-D DPU task per group
++    // on sub-views of the same buffers (the 40XX pipeline does this too)
++    pm.addPass(VPUIP::createBatchMatMulToMatMulPass(log));
+     pm.addPass(VPUIP::createNNDMATilingPass(log));
+     if (options.enableWeightsSparsity) {
+         pm.addPass(VPUIP::createFlattenSparseWeightsTypesPass(log));
+diff --git a/src/vpux_compiler/src/core/barrier_info.cpp b/src/vpux_compiler/src/core/barrier_info.cpp
+index 20144d191..94e09ff77 100644
+--- a/src/vpux_compiler/src/core/barrier_info.cpp
++++ b/src/vpux_compiler/src/core/barrier_info.cpp
+@@ -4,6 +4,8 @@
+ //
+ 
+ #include "vpux/compiler/core/barrier_info.hpp"
++
++#include <cstdlib>
+ #include "vpux/compiler/dialect/VPUIP/utils/utils.hpp"
+ #include "vpux/compiler/dialect/VPURT/utils/barrier_legalization_utils.hpp"
+ #include "vpux/compiler/dialect/config/IR/resources.hpp"
+@@ -2856,6 +2858,66 @@ unsigned vpux::BarrierInfo::createBarrierDependenciesBetweenExecutionGroups(size
+                 newBarriersCount++;
+             }
+         }
++
++        // NPU_RS_DPU1LIST=1 (qwen.rs patch, with the merged DPU list of
++        // ExecutionGroupAnalysis): the NPU37XX runtime reloads a half of the
++        // descriptor ring only after *every* task in it has been cleaned (its
++        // clean_after barrier consumed), not just the last one. A task of
++        // group g whose update barriers also have producers in group g + 2 or
++        // later can never be cleaned before group g + 2 is loaded: deadlock.
++        // Give all such tasks of g one extra barrier consumed by the first
++        // task of g + 1; it becomes their (earlier) clean_after.
++        static const bool oneList = [] {
++            const char* e = std::getenv("NPU_RS_DPU1LIST");
++            return e != nullptr && e[0] == '1';
++        }();
++        if (oneList && (queue.type == VPU::ExecutorKind::DPU || queue.type == VPU::ExecutorKind::SHAVE_ACT)) {
++            for (int grpIdx = 0; grpIdx + 2 < numberOfGroups; grpIdx++) {
++                const auto grandChildStart = fifoExecGroups[grpIdx + 2].front();
++                const auto firstTaskInChildGroup = fifoExecGroups[grpIdx + 1].front();
++                if (getControlGraphBlockIndex(firstTaskInChildGroup) != blockIdx) {
++                    continue;
++                }
++                SmallVector<size_t> late;
++                for (auto task : fifoExecGroups[grpIdx]) {
++                    if (getControlGraphBlockIndex(task) != blockIdx) {
++                        continue;
++                    }
++                    // late: every update barrier (candidate clean_after) has a
++                    // producer in group g + 2 or later
++                    const auto& upd = getUpdateBarriers(task);
++                    bool spans = !upd.empty();
++                    for (auto bar : upd) {
++                        // (its consumption also needs every consumer started)
++                        bool early = true;
++                        for (auto prod : getBarrierProducers(bar)) {
++                            if (prod >= grandChildStart) {
++                                early = false;
++                            }
++                        }
++                        for (auto cons : getBarrierConsumers(bar)) {
++                            if (cons >= grandChildStart) {
++                                early = false;
++                            }
++                        }
++                        if (early) {
++                            spans = false;
++                        }
++                    }
++                    if (spans) {
++                        late.push_back(task);
++                    }
++                }
++                if (late.empty()) {
++                    continue;
++                }
++                auto bar = createBarrierDependencies(late.front(), firstTaskInChildGroup);
++                for (size_t i = 1; i < late.size(); ++i) {
++                    addProducer(bar, late[i]);
++                }
++                newBarriersCount++;
++            }
++        }
+     }
+     _log.trace("New shared barriers in block {0}: {1}", blockIdx, newBarriersCount);
+     return newBarriersCount;
+diff --git a/src/vpux_compiler/src/core/execution_group_analysis.cpp b/src/vpux_compiler/src/core/execution_group_analysis.cpp
+index b4fb94fb2..827017238 100644
+--- a/src/vpux_compiler/src/core/execution_group_analysis.cpp
++++ b/src/vpux_compiler/src/core/execution_group_analysis.cpp
+@@ -7,11 +7,51 @@
+ #include "vpux/compiler/dialect/VPUIP/IR/ops.hpp"
+ #include "vpux/compiler/dialect/config/IR/resources.hpp"
+ #include "vpux/compiler/dialect/config/utils/config_option_utils.hpp"
++#include "vpux/compiler/dialect/config/IR/utils.hpp"
++
++#include <cstdlib>
+ 
+ #include <mlir/Pass/AnalysisManager.h>
+ 
+ namespace vpux {
+ 
++// NPU_RS_DPU1LIST=1 (qwen.rs patch): on NPU37XX the DPU invariants and the
++// ActShave invocations of all tiles share one descriptor list each (every task
++// is <0:0:i> in the ELF), so the descriptor groups must be formed over the
++// merged list in task order, not per tile. Per-tile groups let a barrier's
++// producers span three list halves (e.g. grouped MatMuls split into many
++// tasks behind an unrelated op), which hangs the runtime (device lost).
++static std::map<VPURT::TaskQueueType, SmallVector<uint32_t>> rsMergedQueues(
++        const std::map<VPURT::TaskQueueType, SmallVector<uint32_t>>& map, VPU::ExecutorKind kind,
++        mlir::func::FuncOp func) {
++    static const bool oneList = [] {
++        const char* e = std::getenv("NPU_RS_DPU1LIST");
++        return e != nullptr && e[0] == '1';
++    }();
++    auto queueMap = map;
++    if (!oneList || func == nullptr || !config::isArchVPUX3XXX(config::getArch(func))) {
++        return queueMap;
++    }
++    std::optional<VPURT::TaskQueueType> first;
++    SmallVector<uint32_t> merged;
++    for (auto it = queueMap.begin(); it != queueMap.end();) {
++        if (it->first.type != kind) {
++            ++it;
++            continue;
++        }
++        if (!first.has_value()) {
++            first = it->first;
++        }
++        merged.append(it->second.begin(), it->second.end());
++        it = queueMap.erase(it);
++    }
++    if (first.has_value()) {
++        llvm::sort(merged);
++        queueMap[*first] = merged;
++    }
++    return queueMap;
++}
++
+ ExecutionGroupAnalysis::ExecutionGroupAnalysis(mlir::func::FuncOp func)
+         : ExecutionGroupAnalysis(func, /* ignoreVariantLimit */ false, /* ignoreInvariantLimit */ false) {
+ }
+@@ -54,7 +94,8 @@ ExecutionGroupAnalysis::ExecutionGroupAnalysis()
+ }
+ 
+ void ExecutionGroupAnalysis::createSWTaskExecutionGroups() {
+-    for (auto& [queueType, tileSWQueue] : _taskQueueTypeMap) {
++    auto queueMap = rsMergedQueues(_taskQueueTypeMap, VPU::ExecutorKind::SHAVE_ACT, _func);
++    for (auto& [queueType, tileSWQueue] : queueMap) {
+         if (queueType.type != VPU::ExecutorKind::SHAVE_ACT) {
+             continue;
+         }
+@@ -104,7 +145,8 @@ void ExecutionGroupAnalysis::createSWTaskExecutionGroups() {
+ }
+ 
+ void ExecutionGroupAnalysis::createDPUTaskExecutionGroups() {
+-    for (auto& [queueType, tileDpuQueue] : _taskQueueTypeMap) {
++    auto queueMap = rsMergedQueues(_taskQueueTypeMap, VPU::ExecutorKind::DPU, _func);
++    for (auto& [queueType, tileDpuQueue] : queueMap) {
+         if (queueType.type != VPU::ExecutorKind::DPU) {
+             continue;
+         }
+diff --git a/src/vpux_compiler/src/dialect/IE/utils/matmul.cpp b/src/vpux_compiler/src/dialect/IE/utils/matmul.cpp
+index 4a5115522..f0a1a12e1 100644
+--- a/src/vpux_compiler/src/dialect/IE/utils/matmul.cpp
++++ b/src/vpux_compiler/src/dialect/IE/utils/matmul.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++#include <cstdlib>
+ #include "vpux/compiler/dialect/IE/utils/matmul.hpp"
+ #include "vpux/compiler/core/attributes/shape.hpp"
+ #include "vpux/compiler/core/layers.hpp"
+@@ -156,6 +157,15 @@ bool isGroupedMatMulBeneficial(IE::MatMulOp matmulOp, ShapeRef input1Shape, Shap
+ 
+     const auto groupBiggerThanTiles = isGroupBiggerThanTileCount(matmulOp, input1Shape);
+ 
++    // NPU_RS_GMM_MAXG=N (qwen.rs patch): no grouped MatMul with more than N
++    // groups. On NPU37XX (with the 37XX BatchMatMulToMatMul pass) 112 groups
++    // of [64, 64] run, 128 lose the device (cause not found).
++    if (const char* e = std::getenv("NPU_RS_GMM_MAXG")) {
++        if (input1Shape3d[Dims3D::Act::B] > std::atoll(e)) {
++            return false;
++        }
++    }
++
+     return fitIntoCMX && smallOutputSize && groupBiggerThanTiles;
+ }
+ 
+diff --git a/src/vpux_compiler/src/utils/wlm_legalization_utils.cpp b/src/vpux_compiler/src/utils/wlm_legalization_utils.cpp
+index 678a0235e..6c6e0c9ed 100644
+--- a/src/vpux_compiler/src/utils/wlm_legalization_utils.cpp
++++ b/src/vpux_compiler/src/utils/wlm_legalization_utils.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include <mlir/Pass/AnalysisManager.h>
+ 
++#include <cstdlib>
++
+ namespace vpux {
+ 
+ void updateBarriersForDma(const SmallVector<size_t>& consumes, const SmallVector<size_t>& producesIn,
+@@ -265,6 +267,34 @@ void legalizeScheduleForNonWlm(mlir::func::FuncOp netFunc, BarrierInfo& barrierI
+         VPURT::orderExecutionTasksAndBarriers(netFunc, barrierInfo, log);
+         VPUX_THROW_UNLESS(barrierInfo.verifyControlGraphSplit(), "Encountered split of control graph is incorrect");
+ 
++        // NPU_RS_DPU1LIST=1 (qwen.rs patch): the reordering above can move
++        // the merged list's group boundaries; repeat the insertion until the
++        // groups need no new barrier
++        static const bool oneList = [] {
++            const char* e = std::getenv("NPU_RS_DPU1LIST");
++            return e != nullptr && e[0] == '1';
++        }();
++        for (int round = 0; oneList && round < 16; ++round) {
++            barrierInfo.initializeTaskQueueTypeMap(
++                    {VPU::ExecutorKind::DMA_NN, VPU::ExecutorKind::DPU, VPU::ExecutorKind::SHAVE_ACT});
++            barrierInfo.buildTaskQueueTypeMap();
++            ExecutionGroupAnalysis again(netFunc, /* ignoreVariantLimit */ true, /* ignoreInvariantLimit */ false);
++            size_t added = 0;
++            for (auto executorKind : executors) {
++                auto groups = executorKind == VPU::ExecutorKind::DPU ? again.getDPUExecutionGroups()
++                                                                     : again.getActShvExecutionGroups();
++                for (size_t blk = 0; blk < barrierInfo.getControlGraphBlockCount(); ++blk) {
++                    added += barrierInfo.createBarrierDependenciesBetweenExecutionGroups(blk, groups);
++                }
++            }
++            barrierInfo.clearTaskQueueTypeMap();
++            if (added == 0) {
++                break;
++            }
++            log.info("Round {0}: inserted {1} more descriptor-group barriers", round + 1, added);
++            VPURT::orderExecutionTasksAndBarriers(netFunc, barrierInfo, log);
++        }
++
+         execGroupAnalysis =
+                 ExecutionGroupAnalysis(netFunc, /* ignoreVariantLimit */ true, /* ignoreInvariantLimit */ false);
+         VPUX_THROW_UNLESS(barrierInfo.verifyBarriersForTaskDescriptorFetch(execGroupAnalysis.getExecutionGroups(),

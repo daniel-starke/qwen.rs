@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gguf",
+    "crates/imgio",
+    "crates/vision",
+    "crates/quant",
+    "crates/model",
+    "crates/offload",
+    "crates/tokenizer",
+    "crates/sampler",
+    "crates/prefixcache",
+    "crates/server",
+    "crates/ov",
+    "crates/npu",
+    "crates/npubuild",
+    "crates/imagegen",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["Daniel Starke"]
+readme = "README.md"
+keywords = ["llm", "inference", "qwen", "gguf", "vulkan"]
+categories = ["science"]
+publish = false
+
+# Lints that do not fit the numeric kernels: index loops over several
+# parallel slices, kernel entry points with many scalar parameters, nested
+# buffer types, and full struct literals that keep `..Default::default()` so
+# new fields get a default.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_update = "allow"
+# `let p = p;` makes a closure capture the whole `Send` pointer wrapper
+# instead of its raw-pointer field (edition 2021 disjoint captures).
+redundant_locals = "allow"
+# `!(x > 0.0)` is meant: it rejects NaN too.
+neg_cmp_op_on_partial_ord = "allow"
+# Counters that also advance inside the loop body (kernels, SSE indices).
+explicit_counter_loop = "allow"
+# Fires on initializers that already are `const { .. }` (nightly 1.96).
+missing_const_for_thread_local = "allow"
+# Clippy 1.99: `chunks_exact(N)` -> `as_chunks::<N>()` at ~180 sites, mostly
+# kernel loops; a style rewrite, not a fix. Older clippy does not know it.
+chunks_exact_to_as_chunks = "allow"
+
+[workspace.lints.rust]
+unknown_lints = "allow"
+
+[profile.deploy]
+inherits = "release"
+opt-level = 2
+strip = true
+debug = false
+lto = "fat"
+codegen-units = 1

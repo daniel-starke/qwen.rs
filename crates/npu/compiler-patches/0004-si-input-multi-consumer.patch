@@ -1,0 +1,38 @@
+diff --git a/src/vpux_compiler/src/dialect/IE/utils/quantization.cpp b/src/vpux_compiler/src/dialect/IE/utils/quantization.cpp
+index cc920e785..c17ec7237 100644
+--- a/src/vpux_compiler/src/dialect/IE/utils/quantization.cpp
++++ b/src/vpux_compiler/src/dialect/IE/utils/quantization.cpp
+@@ -565,13 +565,29 @@ mlir::FailureOr<SmallVector<mlir::Operation*>> findNCEOpCandidatesWithWeights(ml
+             return nceOpCandidatesWithWeights;
+         } else {
+             // Propagate pure view and quantization layers with single user
+-            if ((IE::isPureViewOp(currentOp) ||
+-                 mlir::isa<IE::ConvertOp, IE::TransposeOp, IE::FakeQuantizeOp, IE::QuantizeOp, IE::DequantizeOp>(
+-                         currentOp)) &&
+-                currentOp->hasOneUse()) {
++            const bool passThrough =
++                    IE::isPureViewOp(currentOp) ||
++                    mlir::isa<IE::ConvertOp, IE::TransposeOp, IE::FakeQuantizeOp, IE::QuantizeOp, IE::DequantizeOp>(
++                            currentOp);
++            if (passThrough && currentOp->hasOneUse()) {
+                 currentOp = *(currentOp->getUsers().begin());
+                 continue;
+             }
++            // qwen.rs patch: a pass-through op with several users (one
++            // quantized activation feeding several int4-weight MatMuls through
++            // their own reshapes) -- follow every branch; without this the
++            // activation went u8 while the consumers kept i8
++            // (`unrealized_conversion_cast` in ConvertLayers2VPU)
++            if (passThrough && !currentOp->use_empty()) {
++                for (auto user : currentOp->getUsers()) {
++                    auto sub = findNCEOpCandidatesWithWeights(user);
++                    if (mlir::failed(sub)) {
++                        return mlir::failure();
++                    }
++                    nceOpCandidatesWithWeights.append(sub.value().begin(), sub.value().end());
++                }
++                return nceOpCandidatesWithWeights;
++            }
+             break;
+         }
+     }

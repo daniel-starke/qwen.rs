@@ -1,0 +1,111 @@
+/* Softmax over an axis of N elements whose last two slots are not keys:
+ *   p = softmax(x[0 .. N-2)), out[N-2] = max(x), out[N-1] = sum(exp(x - max))
+ * (so log sum exp = out[N-2] + ln out[N-1]). Replaces the Softmax kernel
+ * (softmax_3720xx.elf) of the far-block attention graph (build_attn.py
+ * --part far): the host merges blocks with the two stashed values, and the
+ * value rows of the two slots are zero, so they add nothing to P x V.
+ * The tensor is whole rows of N elements, f16.
+ * -DNONORM=1: p is left as exp(x - max), not divided by the sum (a third of
+ * the kernel's time); the host divides the block's P x V.
+ *
+ *   shave build softmax_lse.sk softmax_3720xx.elf -DN=1024 [-DNONORM=1]
+ */
+#ifndef N
+#define N 4096
+#endif
+#ifndef NONORM
+#define NONORM 0
+#endif
+/* key lanes of the row's last vector: 6 (the last two slots hold max and
+ * sum), 4 (slots N-4 and N-3 are not keys either: a block of 4 N / 4 - 1
+ * whole blocks of 4 keys) */
+#ifndef KL
+#define KL 6
+#endif
+/* vectors per round of each pass */
+#ifndef U
+#define U 8
+#endif
+const u32 NVEC = N / 8;
+const u32 ROUNDS = NVEC / U;
+_Static_assert(N % (8 * U) == 0 && ROUNDS >= 3, "N / 8 / U must be a whole number >= 3");
+
+void controlled_act(const u32 *params) {
+    /* MemRefData records, 0x24 bytes each: the input, then the output */
+    const half8 *restrict x = (const half8 *)params[0];
+    u32 rank = params[2];
+    const u32 *dims = (const u32 *)params[3];
+    half8 *restrict y = (half8 *)params[9];
+    u32 n = 1;
+    do {
+        n *= *dims;
+        dims++;
+        rank--;
+    } while (rank != 0);
+    const half8 *end = (const half8 *)((const half *)x + n);
+    const half8 low = -65504.0, zero = 0.0;
+    do {
+        /* 1: the maximum, U vectors per round */
+        register half8 m[U];
+        half8 last;
+        const half8 *p = x;
+        for (int u = 0; u < U; u++) m[u] = p[u];
+        p += U;
+        for (u32 r = 0; r < ROUNDS - 2; r++) {
+            for (int u = 0; u < U; u++) m[u] = max(m[u], p[u]);
+            p += U;
+        }
+        for (int u = 0; u < U - 1; u++) m[u] = max(m[u], p[u]);
+        /* the row's last vector with its non-key slots at the lowest value */
+        last = align(rot(p[U - 1], 2 * KL), low, 16 - 2 * KL);
+        m[U - 1] = max(m[U - 1], last);
+        for (int s = 1; s < U; s *= 2)
+            for (int u = 0; u + s < U; u += 2 * s) m[u] = max(m[u], m[u + s]);
+        /* every lane = the maximum of the 8 */
+        half8 mv = max(m[0], rot(m[0], 8));
+        mv = max(mv, rot(mv, 4));
+        mv = max(mv, rot(mv, 2));
+
+        /* 2: e = exp(x - max) and its sum (f16: 8 lanes x U sums, each over N / 8 / U terms <= 1) */
+        register half8 acc[U];
+        for (int u = 0; u < U; u++) acc[u] = zero;
+        half8 *q = y;
+        p = x;
+        for (u32 r = 0; r < ROUNDS - 1; r++) {
+            for (int u = 0; u < U; u++) {
+                half8 e = exp(p[u] - mv);
+                q[u] = e;
+                acc[u] += e;
+            }
+            p += U;
+            q += U;
+        }
+        for (int u = 0; u < U; u++) {
+            half8 e;
+            if (u < U - 1) e = exp(p[u] - mv);
+            else e = exp(last - mv);
+            q[u] = e;
+            acc[u] += e;
+        }
+        for (int s = 1; s < U; s *= 2)
+            for (int u = 0; u + s < U; u += 2 * s) acc[u] += acc[u + s];
+        half8 sv = acc[0] + rot(acc[0], 8);
+        sv += rot(sv, 4);
+        sv += rot(sv, 2);
+        half sum = sv[0];
+
+        /* 3: p = e / sum */
+        if (!NONORM) {
+            half8 r = splat(rcp(sum));
+            q = y;
+            for (u32 k = 0; k < ROUNDS; k++) {
+                for (int u = 0; u < U; u++) q[u] = q[u] * r;
+                q += U;
+            }
+        }
+        ((half *)y)[N - 2] = mv[0];
+        ((half *)y)[N - 1] = sum;
+        x += NVEC;
+        y += NVEC;
+    } while (x != end);
+}

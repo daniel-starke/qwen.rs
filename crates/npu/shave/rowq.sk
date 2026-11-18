@@ -1,0 +1,97 @@
+/* The per-row int8 scale of the Qwen-Image transformer's down-projection
+ * input (`npubuild::qimage`, `rowq`), per row of L halves:
+ *   y = x * (127 / 128) / max(max |x|, 1e-3)
+ * which the graph's FakeQuantize puts on the k / 128 grid for the int8
+ * MatMul (the graph rescales the MatMul's output by the same max, computed
+ * beside it). The stock form ran Abs, ReduceMax, Maximum, Divide and a
+ * broadcast Multiply in a chain, 2.2 ms of a 20 ms job.
+ * Carrier: SoftMax over the last axis (`softmax`, unused elsewhere in the
+ * transformer's graphs). A = [1, S, FF (+ PAD)]: the compiler never splits
+ * a softmax's axis, so an invocation sees dims (innermost first) [L, n,
+ * 1] with whole rows, consecutive in input and output alike (the kernel
+ * relies on it; L - PAD a multiple of 16 U). An elementwise carrier does
+ * not do: Mish reached the kernel as [64 rows x 3080 columns] tiles.
+ *
+ * Pass 1 of a row: max |x| in U chains (|x| by clearing the sign bit);
+ * pass 2: y = x * r, r in f32 (one Newton step on the f16 reciprocal).
+ *
+ *   shave build rowq.sk softmax_3720xx.elf [-DPAD=32]
+ *
+ * (and the same ELF as softmax_3720xx_lsu0_wo.elf). */
+#ifndef U
+#define U 8
+#endif
+_Static_assert(U == 8, "U: the rounds are L >> 7 and L >> 6");
+
+void controlled_act(const u32 *params) {
+    /* MemRefData records, 0x24 bytes each: the input, then the output */
+    const half8 *restrict x = (const half8 *)params[0];
+    half8 *restrict y = (half8 *)params[9];
+    u32 rank = params[2];
+    const u32 *dims = (const u32 *)params[3];
+    u32 l = dims[0];
+    /* rows: every dimension but the innermost */
+    u32 n = 1;
+    const u32 *dp = dims + 1;
+    for (u32 d = 1; d < rank; d++) {
+        n *= *dp;
+        dp++;
+    }
+    u32 nv = l >> 3;
+#ifdef PAD
+    /* the last PAD halves of a row are no data: they get the row's max */
+    l = l - PAD;
+#endif
+    /* pass 1: rounds of 2 U vectors (a round's compare waits for its last
+       max), pass 2: rounds of U */
+    u32 rounds1 = l >> 7;
+    u32 rounds = l >> 6;
+    const int4 am = 0x7fff7fff;
+    const half8 lo = 0.001;
+    const float4 two = 2.0, q = 127.0 / 128.0;
+    register half8 m[U];
+    for (u32 i = 0; i < n; i++) {
+        const half8 *p = x;
+#pragma unroll
+        for (int u = 0; u < U; u++)
+            m[u] = max((half8)((int4)p[u] & am), (half8)((int4)p[u + U] & am));
+        p += 2 * U;
+        for (u32 k = 1; k < rounds1; k++) {
+#pragma unroll
+            for (int u = 0; u < U; u++)
+                m[u] = max(m[u], max((half8)((int4)p[u] & am), (half8)((int4)p[u + U] & am)));
+            p += 2 * U;
+        }
+        m[0] = max(m[0], m[4]);
+        m[1] = max(m[1], m[5]);
+        m[2] = max(m[2], m[6]);
+        m[3] = max(m[3], m[7]);
+        m[0] = max(m[0], m[2]);
+        m[1] = max(m[1], m[3]);
+        half8 t = max(m[0], m[1]);
+        /* every lane: the row's max */
+        t = max(t, rot(t, 8));
+        t = max(t, rot(t, 4));
+        t = max(t, rot(t, 2));
+        t = max(t, lo);
+        float4 mf = f16_to_f32(t, 0);
+        float4 r = f16_to_f32(splat(rcp(t[0])), 0);
+        r = r * (two - mf * r);
+        r = r * q;
+        half8 rs = splat(f32_to_f16(r, 0));
+        p = x;
+        half8 *o = y;
+        for (u32 k = 0; k < rounds; k++) {
+#pragma unroll
+            for (int u = 0; u < U; u++) o[u] = p[u] * rs;
+            p += U;
+            o += U;
+        }
+#ifdef PAD
+#pragma unroll
+        for (int u = 0; u < PAD / 8; u++) o[u] = t;
+#endif
+        x += nv;
+        y += nv;
+    }
+}

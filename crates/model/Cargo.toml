@@ -1,0 +1,22 @@
+[package]
+name = "model"
+description = "The hybrid attention / gated delta-net Qwen3.8 model graph, with speculative decoding."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+quant = { path = "../quant" }
+offload = { path = "../offload" }
+
+[features]
+vulkan = ["offload/vulkan"]
+
+[lints]
+workspace = true

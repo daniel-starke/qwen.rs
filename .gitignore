@@ -1,0 +1,17 @@
+# Build artifacts
+/target/
+**/target/
+
+# Python
+/__pycache__/
+**/__pycache__/
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# Claude Code
+.claude/settings.local.json
+
+# Local development log (not published)
+/state.md

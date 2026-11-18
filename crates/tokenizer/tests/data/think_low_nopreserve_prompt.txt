@@ -1,0 +1,30 @@
+<|im_start|>system
+Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.
+
+You are a terse assistant.<|im_end|>
+<|im_start|>user
+What is 2+2?<|im_end|>
+<|im_start|>assistant
+4.<|im_end|>
+<|im_start|>user
+How many lines are in src/main.rs?<|im_end|>
+<|im_start|>assistant
+<think>
+Read the file first.
+</think>
+
+I will look.
+
+<tool_call>
+<function=Read>
+<parameter=file_path>
+/repo/src/main.rs
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+fn main() {}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>

@@ -1,0 +1,17 @@
+[package]
+name = "quant"
+description = "K-quant formats and AVX2 / AVX-VNNI CPU kernels: dequantization, GEMV, GEMM, attention."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+
+[lints]
+workspace = true
