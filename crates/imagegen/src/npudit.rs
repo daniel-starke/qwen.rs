@@ -113,6 +113,15 @@ pub(crate) fn npu() -> Result<&'static Npu, String> {
 
 const KINDS: [&str; 3] = ["dit_pre", "dit_mid", "dit_post"];
 
+/// Load and initialize graph `kind` from `dir` (`{kind}.blob`).
+fn load_graph(npu: &'static Npu, dir: &Path, kind: &str) -> Result<Graph<'static>, String> {
+	let f = dir.join(format!("{kind}.blob"));
+	let b = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+	let mut g = npu.load(&b, 0)?;
+	g.initialize()?;
+	Ok(g)
+}
+
 /// What a graph argument is bound to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Io {
@@ -243,7 +252,11 @@ pub struct NpuDit {
 	npu: &'static Npu,
 	/// Per block the q / k finish on the cores (folded graphs), else none.
 	qk: Option<Vec<QkW>>,
+	/// The graphs ([`KINDS`]); empty while unloaded
+	/// ([`Self::unload_graphs`]), loaded again by the next pass.
 	graphs: Vec<Graph<'static>>,
+	/// Where they are read from.
+	gdir: PathBuf,
 	/// Per graph its arguments' bindings.
 	io: Vec<Vec<Io>>,
 	/// Per block its weight buffers, by the names of [`Self::wnames`].
@@ -985,10 +998,7 @@ impl NpuDit {
 		let mut io = Vec::new();
 		let mut wnames: Vec<String> = Vec::new();
 		for kind in KINDS {
-			let f = c.graphs.join(format!("{kind}.blob"));
-			let b = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
-			let mut g = npu.load(&b, 0)?;
-			g.initialize()?;
+			let g = load_graph(npu, &c.graphs, kind)?;
 			let mut outs = qi::outputs(kind).iter();
 			let mut v = Vec::new();
 			for a in &g.args {
@@ -1099,6 +1109,7 @@ impl NpuDit {
 			npu,
 			qk,
 			graphs,
+			gdir: c.graphs.clone(),
 			io,
 			w,
 			wnames,
@@ -1132,6 +1143,7 @@ impl NpuDit {
 
 	/// Make the buffers hold `rows` rows of a pass and `kv_rows` K / V rows.
 	fn ensure(&mut self, rows: usize, kv_rows: usize) -> Result<(), String> {
+		self.load_graphs()?;
 		let rows = rows.next_multiple_of(S);
 		let kv_rows = kv_rows.max(rows);
 		// exact sizes: a prefix of many reference images makes the prefix
@@ -1995,6 +2007,30 @@ impl NpuDit {
 		let b = self.bufs.as_ref().unwrap();
 		// SAFETY: no job runs
 		unsafe { prefix_kv(b, &self.pk, &self.pv, l, p) };
+	}
+
+	/// Unload the graphs, keeping the weights: they hold driver memory that
+	/// every NPU user of the process shares, and a chat engine on the NPU
+	/// does not fit beside them (`0x70000002`). The next pass loads them
+	/// again.
+	pub fn unload_graphs(&mut self) {
+		self.graphs.clear();
+	}
+
+	/// Load the graphs if [`Self::unload_graphs`] dropped them.
+	fn load_graphs(&mut self) -> Result<(), String> {
+		if !self.graphs.is_empty() {
+			return Ok(());
+		}
+		for (k, kind) in KINDS.iter().enumerate() {
+			let g = load_graph(self.npu, &self.gdir, kind)?;
+			if g.args.len() != self.io[k].len() {
+				self.graphs.clear();
+				return Err(format!("{kind}: the graph's arguments changed since the load"));
+			}
+			self.graphs.push(g);
+		}
+		Ok(())
 	}
 
 	/// Free the per-image buffers (the weights stay).

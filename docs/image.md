@@ -224,11 +224,20 @@ the same JSON with `images` as `data:` URLs) return
   then is dropped, and the recycling allocator's cached blocks with it
   (`quant::alloc::trim`, since otherwise up to `QWEN_ALLOC_CACHE_MB` of freed
   weights would stay resident).
-- **NPU.** The image graphs load next to the chat engine's sets. With
-  Flash-Next's full `model.npu` there is no `0x70000002`, chat works before
-  and after an image job, and the job's transformer takes 32.2 s against
-  31.5 s alone at 512x512. Each layer's command list is recorded per run and dropped
-  after it, so the image model holds no lists between jobs. The NPU lock
+- **NPU.** The image graphs load next to the chat engine's sets. Graphs
+  and recorded command lists of both share one driver memory pool, and a
+  1 MP job does not fit beside Flash-Next's prefill set, recorded lists and
+  vision tower (`0x70000002`). So each image job first has the chat engine
+  unload its NPU graphs (`Engine::release_devices`; Flash-Next keeps every
+  buffer and its state, and loads the graphs again at its next prefill
+  chunk or image, at no measurable prefill cost), and after a job the
+  model unloads its NPU graphs in turn: the transformer's (its weights
+  stay), the VAE decoder and the vision tower, all loaded again by the
+  next job; with them loaded, the chat engine's next prefill fails the same
+  way. A job that
+  fails with an error unloads the whole model, so the next chat request
+  has the device's memory. Each layer's command list is recorded per run
+  and dropped after it, so the image model holds no lists between jobs. The NPU lock
   (`Global\qwen-rs-npu`) is taken on a thread of its own
   (`NpuLock::shared`), because the idle unload drops the model on another
   thread than the one that loaded it and a mutex belongs to its thread. It

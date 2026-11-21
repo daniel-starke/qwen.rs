@@ -126,7 +126,13 @@ pub struct NpuVision {
 	/// The learned position grid, `[n_pos][embd]`.
 	pub pos_w: Vec<f32>,
 	npu: &'static Npu,
-	graphs: &'static mut Vec<Graph<'static>>,
+	/// the set's directory (the blobs are read again after [`Self::unload`])
+	dir: std::path::PathBuf,
+	/// the `layers + 1` graphs, bound to `job`; empty while unloaded
+	graphs: Vec<Graph<'static>>,
+	/// the graphs' blobs: the driver reads a blob after `pfnCreate2`
+	/// returns, so each lives as long as its graph (dropped after them)
+	blobs: Vec<Vec<u8>>,
 	/// one job's rows: patch, pos, x, a, xo, qkv, emb, then each deepstack
 	/// merger's
 	job: Vec<HostBuf<'static>>,
@@ -190,17 +196,6 @@ impl NpuVision {
 				cfg.embd
 			));
 		}
-		let mut raws = Vec::new();
-		for i in 0..=cfg.layers {
-			let f = d.join(format!("vis{i}.blob"));
-			raws.push(std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?);
-		}
-		let raws: &'static Vec<Vec<u8>> = Box::leak(Box::new(raws));
-		let graphs: &'static mut Vec<Graph<'static>> = Box::leak(Box::new(
-			raws.iter()
-				.map(|b| npu.load(b, 0))
-				.collect::<Result<Vec<_>, _>>()?,
-		));
 		let (s, e) = (cfg.s, cfg.embd);
 		let sizes = [
 			s * cfg.plen(),
@@ -217,6 +212,36 @@ impl NpuVision {
 			let mut b = npu.alloc(n * 2)?;
 			b.as_mut_slice().fill(0);
 			job.push(b);
+		}
+		let mut v = NpuVision {
+			cfg,
+			pos_w,
+			npu,
+			dir: d.to_path_buf(),
+			graphs: Vec::new(),
+			blobs: Vec::new(),
+			job,
+			img: None,
+			old: Vec::new(),
+		};
+		v.load_graphs()?;
+		Ok(v)
+	}
+
+	/// Load, bind and initialize the graphs (no-op when loaded).
+	fn load_graphs(&mut self) -> Result<(), String> {
+		if !self.graphs.is_empty() {
+			return Ok(());
+		}
+		let (cfg, job, d) = (&self.cfg, &self.job, &self.dir);
+		let dir = d.display();
+		let mut graphs = Vec::with_capacity(cfg.layers + 1);
+		let mut blobs = Vec::with_capacity(cfg.layers + 1);
+		for i in 0..=cfg.layers {
+			let f = d.join(format!("vis{i}.blob"));
+			let b = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+			graphs.push(self.npu.load(&b, 0)?);
+			blobs.push(b);
 		}
 		for (i, g) in graphs.iter_mut().enumerate() {
 			// (the driver names an output after the op that computes it:
@@ -257,15 +282,17 @@ impl NpuVision {
 			}
 			g.initialize()?;
 		}
-		Ok(NpuVision {
-			cfg,
-			pos_w,
-			npu,
-			graphs,
-			job,
-			img: None,
-			old: Vec::new(),
-		})
+		self.graphs = graphs;
+		self.blobs = blobs;
+		Ok(())
+	}
+
+	/// Destroy the graphs and keep the buffers: an initialized graph holds
+	/// driver memory every other NPU user of the process shares
+	/// (`0x70000002` when it runs out). The next encode loads them again.
+	pub fn unload(&mut self) {
+		self.graphs.clear();
+		self.blobs.clear();
 	}
 
 	fn buf(&mut self, io: Io) -> &mut [u8] {
@@ -321,6 +348,15 @@ impl NpuVision {
 		}
 		let timing = std::env::var_os("QWEN_NPU_VIS_TIMING").is_some();
 		let t0 = std::time::Instant::now();
+		if self.graphs.is_empty() {
+			self.load_graphs()?;
+			if timing {
+				eprintln!(
+					"  [npu] vision: graphs loaded in {:.0} ms",
+					t0.elapsed().as_secs_f64() * 1e3
+				);
+			}
+		}
 		let chunks = n.div_ceil(s);
 		if self
 			.img

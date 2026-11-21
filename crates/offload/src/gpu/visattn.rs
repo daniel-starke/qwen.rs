@@ -42,10 +42,10 @@ pub struct VisAttn {
 	align: usize,
 	/// rotated Q and K, V (all three f32, per head), a tile's scores and
 	/// their rows' largest one and sum (in parts), the cos / sin table (host
-	/// visible, mapped at `cs_map`), for `cap` patches
+	/// visible, mapped at `cs_map`); `have` holds their sizes in bytes
 	bufs: [(vk::Buffer, vk::DeviceMemory); 6],
 	cs_map: *mut f32,
-	cap: usize,
+	have: [usize; 6],
 	/// the positions the table holds
 	hw: Vec<(u32, u32)>,
 	/// (qkv, out, patches) the descriptor sets were made for
@@ -120,7 +120,7 @@ impl VisAttn {
 			align,
 			bufs: [(vk::Buffer::null(), vk::DeviceMemory::null()); 6],
 			cs_map: ptr::null_mut(),
-			cap: 0,
+			have: [0; 6],
 			hw: Vec::new(),
 			bound: (0, 0, 0),
 			sets: [vk::DescriptorSet::null(); 2],
@@ -146,35 +146,49 @@ impl VisAttn {
 				b.0 = vk::Buffer::null();
 			}
 		}
-		self.cap = 0;
+		self.have = [0; 6];
 	}
 
-	/// The device buffers for `n` patches of `heads` heads.
-	fn ensure(&mut self, n: usize, heads: usize) -> Result<(), String> {
-		if n <= self.cap {
-			return Ok(());
-		}
-		self.free_bufs();
+	/// Bytes of each buffer for `n` patches of `heads` heads. Not monotonic
+	/// in `n`: the tile of queries widens as the keys get fewer, so a
+	/// smaller image can need more of `SI` (and of `SC`) than a larger one.
+	fn sizes(n: usize, heads: usize) -> [usize; 6] {
 		let nq = n.next_multiple_of(8);
 		let tile = Self::tile(n);
 		let qb = heads * nq * HD * 4;
+		let mut s = [0; 6];
+		s[Q] = qb;
+		s[K] = qb;
+		s[V] = qb;
+		s[SC] = heads * tile * nq * 4;
+		s[SI] = heads * tile * 64;
+		s[CS] = n * HD * 4;
+		s
+	}
+
+	/// The device buffers for `n` patches of `heads` heads: kept while each
+	/// is large enough, else all made again at the larger of both sizes.
+	fn ensure(&mut self, n: usize, heads: usize) -> Result<(), String> {
+		let need = Self::sizes(n, heads);
+		if need.iter().zip(&self.have).all(|(n, h)| n <= h) {
+			return Ok(());
+		}
+		let mut want = need;
+		for (w, h) in want.iter_mut().zip(&self.have) {
+			*w = (*w).max(*h);
+		}
+		self.free_bufs();
 		let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
 		let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-		for (i, sz, props) in [
-			(Q, qb, local),
-			(K, qb, local),
-			(V, qb, local),
-			(SC, heads * tile * nq * 4, local),
-			(SI, heads * tile * 64, local),
-			(CS, n * HD * 4, host),
-		] {
+		for (i, &sz) in want.iter().enumerate() {
+			let props = if i == CS { host } else { local };
 			self.bufs[i] = self
 				.dev
 				.try_create_gpu_buffer(sz as u64, vk::BufferUsageFlags::STORAGE_BUFFER, props)
 				.ok_or(format!("vision attention: no device memory for {sz} bytes"))?;
 		}
-		self.cs_map = self.dev.map(self.bufs[CS].1, n * HD * 4) as *mut f32;
-		self.cap = n;
+		self.cs_map = self.dev.map(self.bufs[CS].1, want[CS]) as *mut f32;
+		self.have = want;
 		self.hw.clear();
 		self.bound = (0, 0, 0);
 		Ok(())
@@ -191,7 +205,7 @@ impl VisAttn {
 		let inv: Vec<f64> = (0..quarter)
 			.map(|k| 1.0 / 10000f64.powf(2.0 * k as f64 / half as f64))
 			.collect();
-		// SAFETY: the mapping holds `cap * HD` floats and `hw.len() <= cap`
+		// SAFETY: `ensure(hw.len())` mapped at least `hw.len() * HD` floats
 		let t = unsafe { std::slice::from_raw_parts_mut(self.cs_map, hw.len() * HD) };
 		for (s, &(hp, wp)) in hw.iter().enumerate() {
 			for j in 0..half {

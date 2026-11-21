@@ -40,6 +40,29 @@ struct Slot {
 
 static MODEL: Mutex<Option<Slot>> = Mutex::new(None);
 
+/// What the chat engine frees before an image job ([`on_image_job`]).
+type MakeRoom = Box<dyn Fn() + Send + Sync>;
+static MAKE_ROOM: OnceLock<MakeRoom> = OnceLock::new();
+
+/// Set what runs before each image job, once no chat request runs (the
+/// server: the chat engine's `Engine::release_devices`).
+pub(crate) fn on_image_job(f: impl Fn() + Send + Sync + 'static) {
+	let _ = MAKE_ROOM.set(Box::new(f));
+}
+
+/// Drop the loaded model now (and the allocator's cached blocks of it).
+fn unload(why: &str) {
+	let mut g = MODEL.lock().unwrap_or_else(|e| e.into_inner());
+	if g.take().is_some() {
+		drop(g);
+		let t = quant::alloc::trim();
+		eprintln!(
+			"image: model unloaded {why} ({:.1} GB of cached blocks released)",
+			t as f64 / 1e9
+		);
+	}
+}
+
 /// Enable the image routes (call once, before serving). Starts the idle
 /// unloader.
 pub fn configure(cfg: ImageCfg) {
@@ -163,6 +186,11 @@ pub(crate) fn run(
 	if cancel.load(Ordering::Relaxed) {
 		return Err("canceled".into());
 	}
+	// the chat engine's NPU graphs share the driver's memory with this
+	// model's, and a job does not fit beside Flash-Next's (0x70000002)
+	if let Some(f) = MAKE_ROOM.get() {
+		f();
+	}
 	// `--progress`: a stderr line per stage and step next to the caller's reports
 	let bar = model::progress::Stages::start("image");
 	let progress = &mut |stage: &str, i: usize, n: usize| {
@@ -210,8 +238,20 @@ pub(crate) fn run(
 	if let Some(s) = MODEL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
 		s.last = Instant::now();
 	}
+	// (before the devices lock is released: a chat request may follow)
+	m.release_devices();
 	drop(m);
-	let out = r?;
+	let out = match r {
+		Ok(o) => o,
+		Err(e) => {
+			// a device error leaves the model's graphs holding what the next
+			// chat request or job may need; loaded again by the next job
+			if e != "canceled" {
+				unload("after a failed job");
+			}
+			return Err(e);
+		}
+	};
 	let mut rgba = out.rgba;
 	if !job.transparent {
 		over_white(&mut rgba);

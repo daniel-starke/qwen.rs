@@ -3109,6 +3109,23 @@ impl FlashEngine {
 		rope_sc(&self.imgs, p)
 	}
 
+	/// Unload the NPU graphs and their recorded lists (the active prefill
+	/// or one-position set, the far graphs, the vision tower's), keeping
+	/// every buffer and the state: they hold driver memory that every NPU
+	/// user of the process shares, and with them loaded an image model's
+	/// job does not fit beside them (`0x70000002`). The next chunk and the
+	/// next image load them again.
+	pub fn release_npu(&mut self) {
+		self.far = None;
+		self.far_tried = false;
+		for s in &mut self.sets {
+			s.deactivate();
+		}
+		if let Some(v) = self.vis.as_mut() {
+			v.unload();
+		}
+	}
+
 	/// The vision tower's configuration and its learned position grid
 	/// (`[n_pos][embd]`), when the config names one (`vision = DIR`).
 	pub fn vision(&self) -> Option<(&crate::vis::VisCfg, &[f32])> {
@@ -3689,7 +3706,8 @@ impl FlashEngine {
 	/// GPU step uses too; 1: the one-position set).
 	fn use_set(&mut self, cur: usize) -> Result<(), String> {
 		if cur == self.cur {
-			return Ok(());
+			// (no-op unless [`Self::release_npu`] unloaded it)
+			return self.sets[cur].activate(self.npu, &self.weights, if cur == 1 { "_d1" } else { "" }, self.wb);
 		}
 		let t = std::time::Instant::now();
 		// the far graphs only next to the prefill set (more graphs at

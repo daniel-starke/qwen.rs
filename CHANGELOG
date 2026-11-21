@@ -4,5 +4,11 @@ M.N.P
 | +---- minor: increased if syntax/semantic breaking changes were applied
 +------ major: increased if elementary changes (from user's point of view) were made
 
+1.0.1 (2026-11-21)
+ - fixed: images read as blank or noise by the vision tower of the NPU engines
+ - fixed: wrong answers about an image sent after a larger one on the NPU engines
+ - fixed: image generation (MCP) failing with error 0x70000002 when served next to Flash-Next
+ - fixed: chat requests failing with error 0x70000002 after an image generation job
+
 1.0.0 (2026-11-18)
  - first release

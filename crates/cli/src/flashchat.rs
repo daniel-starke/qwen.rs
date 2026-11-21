@@ -682,6 +682,10 @@ impl server::Engine for FlashServerEngine {
 		self.eng.feed(ids)
 	}
 
+	fn release_devices(&mut self) {
+		self.eng.release_npu();
+	}
+
 	fn can_snapshot(&self) -> Option<bool> {
 		Some(true)
 	}

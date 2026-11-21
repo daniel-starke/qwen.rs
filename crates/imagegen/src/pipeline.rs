@@ -128,6 +128,23 @@ struct VisSlot(Option<npu::vis::NpuVision>);
 unsafe impl Send for VisSlot {}
 
 impl Model {
+	/// Free the NPU graphs between jobs, keeping the transformer's weights:
+	/// the transformer's graphs, the VAE decoder and the vision tower hold
+	/// driver memory that a chat engine on the NPU shares, and its next
+	/// prefill fails beside them (`0x70000002`). The next job loads them
+	/// again.
+	pub fn release_devices(&self) {
+		if let Some((_, m)) = &self.npu_vis {
+			m.lock().unwrap_or_else(|e| e.into_inner()).0 = None;
+		}
+		if let Some((_, m)) = &self.npu_vae {
+			*m.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		}
+		if let Some(n) = &self.npu {
+			n.lock().unwrap_or_else(|e| e.into_inner()).unload_graphs();
+		}
+	}
+
 	/// True when `path` is something [`Self::load`] takes: a checkpoint
 	/// directory or an `image.npu`.
 	pub fn is_model(path: &Path) -> bool {

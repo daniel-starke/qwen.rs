@@ -131,6 +131,11 @@ pub trait Engine: Send {
 	) -> Result<(), String> {
 		Err("this engine takes no images".into())
 	}
+	/// Free what the engine holds on the devices beyond its state, before an
+	/// image job runs (`images::run`, no request running): an NPU engine's
+	/// graphs share the driver's memory with the image model's. The engine
+	/// loads them again when it next needs them.
+	fn release_devices(&mut self) {}
 }
 
 /// What the server needs to know of an engine's vision tower to lay an
@@ -3750,6 +3755,14 @@ fn serve_loaded(loaded: Loaded, host: &str, port: u16, what: &str) {
 	}
 	eprintln!("{}", current_profile().describe());
 	let loaded = Arc::new(loaded);
+	if matches!(loaded.backend, Backend::Engine { .. }) {
+		let l = loaded.clone();
+		images::on_image_job(move || {
+			if let Backend::Engine { eng, .. } = &l.backend {
+				eng.lock().unwrap_or_else(|e| e.into_inner()).release_devices();
+			}
+		});
+	}
 	let addr = format!("{host}:{port}");
 	let listener = match TcpListener::bind(&addr) {
 		Ok(l) => l,

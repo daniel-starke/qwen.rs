@@ -1,7 +1,9 @@
 //! Check and time `VisAttn` (the vision tower's attention kernels,
 //! `vis_rope_npu.glsl`, `vis_qk_npu.glsl`, `vis_sm_npu.glsl`,
 //! `vis_pv_npu.glsl`) on random data against an f64 reference:
-//!   cargo run --release -p offload --features vulkan --example visbench [adapter] [gw] [gh]
+//!   cargo run --release -p offload --features vulkan --example visbench [adapter] [gw] [gh] [gw0 gh0]
+//! `gw0 gh0`: run a `gw0 x gh0` grid through the same object first (the
+//! buffers then come from the larger image, as in a server's second image).
 //! Prints the worst relative error over a sample of (patch, head) rows and
 //! ms per block for a `gw x gh` patch grid.
 
@@ -40,6 +42,21 @@ fn main() {
 	let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 2) };
 	let ob = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 2) };
 	let mut va = VisAttn::new(Some(pick)).expect("device");
+	if let (Some(w0), Some(h0)) = (
+		a.get(3).and_then(|v| v.parse::<usize>().ok()),
+		a.get(4).and_then(|v| v.parse::<usize>().ok()),
+	) {
+		let n0 = w0 * h0;
+		let hw0: Vec<(u32, u32)> = (0..n0).map(|i| ((i / w0) as u32, (i % w0) as u32)).collect();
+		let x0 = vec![0x3c00u16; n0 * 3 * H * HD];
+		let mut o0 = vec![0u16; n0 * H * HD];
+		let xb0 = unsafe { std::slice::from_raw_parts(x0.as_ptr() as *const u8, x0.len() * 2) };
+		let ob0 =
+			unsafe { std::slice::from_raw_parts_mut(o0.as_mut_ptr() as *mut u8, o0.len() * 2) };
+		va.attend(H, &hw0, xb0, ob0).unwrap();
+		// (the imports keep these addresses)
+		std::mem::forget((x0, o0));
+	}
 	va.attend(H, &hw, xb, ob).unwrap();
 	// reference: 2-D RoPE (pairs (j, j + 36); the first 18 the row's
 	// angles, the next 18 the column's), softmax(q k / sqrt(72)) v
