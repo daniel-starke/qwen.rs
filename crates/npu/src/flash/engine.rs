@@ -3707,7 +3707,12 @@ impl FlashEngine {
 	fn use_set(&mut self, cur: usize) -> Result<(), String> {
 		if cur == self.cur {
 			// (no-op unless [`Self::release_npu`] unloaded it)
-			return self.sets[cur].activate(self.npu, &self.weights, if cur == 1 { "_d1" } else { "" }, self.wb);
+			return self.sets[cur].activate(
+				self.npu,
+				&self.weights,
+				if cur == 1 { "_d1" } else { "" },
+				self.wb,
+			);
 		}
 		let t = std::time::Instant::now();
 		// the far graphs only next to the prefill set (more graphs at

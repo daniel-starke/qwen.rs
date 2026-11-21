@@ -3759,7 +3759,9 @@ fn serve_loaded(loaded: Loaded, host: &str, port: u16, what: &str) {
 		let l = loaded.clone();
 		images::on_image_job(move || {
 			if let Backend::Engine { eng, .. } = &l.backend {
-				eng.lock().unwrap_or_else(|e| e.into_inner()).release_devices();
+				eng.lock()
+					.unwrap_or_else(|e| e.into_inner())
+					.release_devices();
 			}
 		});
 	}

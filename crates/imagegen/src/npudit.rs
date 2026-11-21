@@ -2026,7 +2026,9 @@ impl NpuDit {
 			let g = load_graph(self.npu, &self.gdir, kind)?;
 			if g.args.len() != self.io[k].len() {
 				self.graphs.clear();
-				return Err(format!("{kind}: the graph's arguments changed since the load"));
+				return Err(format!(
+					"{kind}: the graph's arguments changed since the load"
+				));
 			}
 			self.graphs.push(g);
 		}

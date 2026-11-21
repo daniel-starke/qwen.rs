@@ -47,7 +47,9 @@ fn main() {
 		a.get(4).and_then(|v| v.parse::<usize>().ok()),
 	) {
 		let n0 = w0 * h0;
-		let hw0: Vec<(u32, u32)> = (0..n0).map(|i| ((i / w0) as u32, (i % w0) as u32)).collect();
+		let hw0: Vec<(u32, u32)> = (0..n0)
+			.map(|i| ((i / w0) as u32, (i % w0) as u32))
+			.collect();
 		let x0 = vec![0x3c00u16; n0 * 3 * H * HD];
 		let mut o0 = vec![0u16; n0 * H * HD];
 		let xb0 = unsafe { std::slice::from_raw_parts(x0.as_ptr() as *const u8, x0.len() * 2) };
