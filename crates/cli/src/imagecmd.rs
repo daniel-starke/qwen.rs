@@ -1,6 +1,7 @@
-//! `cli QWEN_IMAGE_DIR --txt2img PROMPT -o FILE.png [--image FILE]...`: one
-//! image (an edit with condition images) without a server (`imagegen`'s
-//! CPU backend; `QWEN_IMAGE_WEIGHTS=f32` is the reference).
+//! `cli IMAGE_MODEL --txt2img PROMPT -o FILE.png [--image FILE]...`: one
+//! image (an edit with condition images) without a server, Qwen-Image or
+//! MiniMax-H3-Image by the path (`imagegen`'s CPU backend;
+//! `QWEN_IMAGE_WEIGHTS=f32` is the reference).
 
 /// Run it; the process exit code.
 pub fn main(dir: &str, args: &[String]) -> i32 {
@@ -45,6 +46,7 @@ pub fn main(dir: &str, args: &[String]) -> i32 {
 			},
 			"--noise" => noise = Some(val("--noise")),
 			"--progress" => quant::progress::set_enabled(true),
+			"--image-cache" => imagegen::wcache::set_dir(val("--image-cache").into()),
 			"--image" => images.push(std::path::PathBuf::from(val("--image")).into()),
 			"--resolution" => match val("--resolution").parse() {
 				Ok(r) if r >= 32 => resolution = r,
@@ -59,12 +61,22 @@ pub fn main(dir: &str, args: &[String]) -> i32 {
 			}
 		}
 	}
-	if images.len() > imagegen::MAX_IMAGES {
+	let Some(kind) = imagegen::Kind::of(std::path::Path::new(dir)) else {
+		eprintln!("error: {dir}: not an image model");
+		return 2;
+	};
+	let info = kind.info();
+	if images.len() > info.max_images {
 		eprintln!(
-			"error: at most {} --image (got {})",
-			imagegen::MAX_IMAGES,
+			"error: {} takes at most {} --image (got {})",
+			info.name,
+			info.max_images,
 			images.len()
 		);
+		return 2;
+	}
+	if steps != 0 && !info.steps {
+		eprintln!("error: {} has a fixed step count (no --steps)", info.name);
 		return 2;
 	}
 	let (Some(prompt), Some(out)) = (prompt, out) else {

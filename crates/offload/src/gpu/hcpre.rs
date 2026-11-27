@@ -96,15 +96,15 @@ impl HcPre {
 		let i8 = dev.use_dp4a && std::env::var("QWEN_FLASH_HC_DP4A").map_or(true, |v| v != "0");
 		let spv: [&[u8]; 3] = if i8 {
 			[
-				include_bytes!("../shaders/hc_norm_dp4a.spv"),
-				include_bytes!("../shaders/hc_down_dp4a.spv"),
-				include_bytes!("../shaders/hc_up_dp4a.spv"),
+				quant::packed!("hc_norm_dp4a.spv"),
+				quant::packed!("hc_down_dp4a.spv"),
+				quant::packed!("hc_up_dp4a.spv"),
 			]
 		} else {
 			[
-				include_bytes!("../shaders/hc_norm_npu.spv"),
-				include_bytes!("../shaders/hc_down_npu.spv"),
-				include_bytes!("../shaders/hc_up_npu.spv"),
+				quant::packed!("hc_norm_npu.spv"),
+				quant::packed!("hc_down_npu.spv"),
+				quant::packed!("hc_up_npu.spv"),
 			]
 		};
 		let sm = [

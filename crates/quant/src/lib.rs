@@ -36,6 +36,7 @@ pub mod gemv_q6k;
 pub mod knob;
 pub mod linear;
 pub mod ltime;
+pub mod packed;
 pub mod parallel;
 pub mod progress;
 pub mod q8k;

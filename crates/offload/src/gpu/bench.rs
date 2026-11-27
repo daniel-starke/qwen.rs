@@ -108,11 +108,8 @@ impl GpuDevice {
 		}
 
 		// Pipeline, specialized on TILE.
-		let sm = create_sm(
-			&self.device,
-			&load_spv(include_bytes!("../shaders/alu_probe.spv")),
-		)
-		.expect("alu_probe shader module");
+		let sm = create_sm(&self.device, &load_spv(quant::packed!("alu_probe.spv")))
+			.expect("alu_probe shader module");
 		let spec_data = tile.to_le_bytes();
 		let spec_entry = vk::SpecializationMapEntry {
 			constant_id: 0,
@@ -623,7 +620,7 @@ impl GpuDevice {
 			Some(path) => {
 				std::fs::read(path).unwrap_or_else(|e| panic!("delta_probe: read {path}: {e}"))
 			}
-			None => include_bytes!("../shaders/delta_prefill.spv").to_vec(),
+			None => quant::packed!("delta_prefill.spv").to_vec(),
 		};
 		let (secs, o, st) = self.scan_probe(
 			&code,
@@ -666,7 +663,7 @@ impl GpuDevice {
 			Some(path) => {
 				std::fs::read(path).unwrap_or_else(|e| panic!("delta_npu_probe: read {path}: {e}"))
 			}
-			None => include_bytes!("../shaders/delta_prefill_npu.spv").to_vec(),
+			None => quant::packed!("delta_prefill_npu.spv").to_vec(),
 		};
 		self.scan_probe(
 			&code,

@@ -1,16 +1,16 @@
-//! Condition images of an edit, prepared as the pipeline prepares them.
+//! Condition images of an edit and the text encoder's vision tower over
+//! them ([`vision_rows`]), shared by the image models.
 //!
-//! Each image is converted to RGBA and resized once, with Pillow's Lanczos
-//! (on the premultiplied form, as Pillow resizes RGBA), to about
-//! `resolution`^2 pixels at its own aspect, sides multiples of 32
-//! ([`dims`]). That one copy feeds both encoders: the VAE reads all four
-//! channels in [-1, 1]; the vision tower reads it composited over white
-//! (Pillow's `paste` with the alpha as mask), through Qwen3-VL's processor,
-//! whose own resize is the identity at these sizes. The target takes the
-//! last image's aspect at the same area, unless the caller gives a size.
+//! [`Cond::new`] prepares an image as Qwen-Image's pipeline does: converted
+//! to RGBA and resized once, with Pillow's Lanczos (on the premultiplied
+//! form, as Pillow resizes RGBA), to about `resolution`^2 pixels at its own
+//! aspect, sides multiples of 32 ([`dims`]). That one copy feeds both of its
+//! encoders (the VAE's input: [`crate::qimage::cond`]); the vision tower
+//! reads it composited over white (Pillow's `paste` with the alpha as
+//! mask), through Qwen3-VL's processor, whose own resize is the identity at
+//! these sizes. MiniMax-H3-Image builds its [`Cond`]s at its own sizes.
 
 use crate::te::VisionRows;
-use crate::vae::Map;
 use imgio::pil;
 use npubuild::st::{parse_json, Checkpoint, Json};
 use std::path::Path;
@@ -75,34 +75,11 @@ impl Cond {
 		})
 	}
 
-	/// The VAE encoder's input: `[h][w][4]` in [-1, 1].
-	pub fn vae_pixels(&self) -> Map {
-		Map {
-			h: self.h,
-			w: self.w,
-			c: 4,
-			d: self
-				.rgba
-				.iter()
-				.map(|&v| 2.0 * (v as f32 / 255.0) - 1.0)
-				.collect(),
-		}
-	}
-
 	/// The vision tower's copy: alpha composited over white.
 	pub fn te_image(&self) -> imgio::Image {
 		imgio::Image::from_rgb(self.w, self.h, pil::over_white(&self.rgba))
 			.expect("over_white keeps the size")
 	}
-}
-
-/// The target size for these conditions at `resolution`: the last image's
-/// aspect, ~`resolution`^2 pixels.
-pub fn target(conds: &[Cond], resolution: usize) -> Option<(usize, usize)> {
-	let c = conds.last()?;
-	let r = resolution as f64;
-	let (w, h) = dims(r * r, c.orig.0 as f64 / c.orig.1 as f64);
-	Some((w / 32 * 32, h / 32 * 32))
 }
 
 /// The processor's pixel bounds (`processor_config.json`

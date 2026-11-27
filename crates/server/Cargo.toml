@@ -21,6 +21,9 @@ vision = { path = "../vision" }
 prefixcache = { path = "../prefixcache" }
 imagegen = { path = "../imagegen" }
 
+[build-dependencies]
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
 [features]
 vulkan = ["model/vulkan", "vision/vulkan"]
 

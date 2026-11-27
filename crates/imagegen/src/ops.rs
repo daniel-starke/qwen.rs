@@ -19,6 +19,19 @@ pub fn rows_mut(x: &mut [f32], w: usize, f: impl Fn(&mut [f32]) + Sync + Send) {
 	});
 }
 
+/// `f(r, row)` for each `w`-wide row `r` of `x`, in parallel.
+pub fn rows_mut_idx(x: &mut [f32], w: usize, f: impl Fn(usize, &mut [f32]) + Sync + Send) {
+	let n = x.len() / w;
+	let p = Ptr(x.as_mut_ptr());
+	par_for(n, move |r| {
+		let p = p;
+		// SAFETY: task r owns row r
+		f(r, unsafe {
+			std::slice::from_raw_parts_mut(p.0.add(r * w), w)
+		})
+	});
+}
+
 /// `f(i, chunk)` over chunks of `c` elements, in parallel.
 pub fn chunks_mut(x: &mut [f32], c: usize, f: impl Fn(usize, &mut [f32]) + Sync + Send) {
 	let n = x.len();
@@ -164,7 +177,8 @@ fn rot_signs() -> &'static [f32] {
 	S.get_or_init(|| npubuild::gptq::signs(RB))
 }
 
-fn rot_on() -> bool {
+/// Whether K-quant weights are stored rotated (`QWEN_IMAGE_ROT`, default on).
+pub fn rot_on() -> bool {
 	std::env::var("QWEN_IMAGE_ROT").map_or(true, |v| v != "0")
 }
 

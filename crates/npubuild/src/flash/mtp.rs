@@ -4,6 +4,10 @@
 //! s`), every vector f32 (`NAME.f32`, RMSNorm weights as `1 + w`). No
 //! calibration: the drafter's activations stay f32, and int8 per row needs
 //! none; a draft only decides how many positions a verify step takes.
+//! The routed experts also as int4 in groups of [`Q4G`] (`NAME.q4` codes,
+//! the even element in the low nibble, value + 8; `NAME.q4s` f16 group
+//! scales: `w ~= (c - 8) s`), which the drafter loads in place of their
+//! int8 form: half the bytes a draft reads.
 
 use std::path::Path;
 
@@ -28,6 +32,57 @@ fn q8(w: &[f32], k: usize) -> (Vec<u8>, Vec<u8>) {
 		s.extend_from_slice(&sc.to_le_bytes());
 	}
 	(c, s)
+}
+
+/// Weights per int4 group scale.
+pub const Q4G: usize = 32;
+
+/// Rows of `w` as int4 in groups of [`Q4G`] (symmetric, max-abs / 7):
+/// codes, f16 scales (little endian).
+fn q4(w: &[f32], c: &mut Vec<u8>, s: &mut Vec<u8>) {
+	for g in w.chunks_exact(Q4G) {
+		let m = g.iter().fold(0f32, |a, v| a.max(v.abs()));
+		let sc = npu::ir::f16_bits(m / 7.0);
+		let d = npu::ir::f16_to_f32(sc);
+		let q = |v: f32| {
+			let q = if d > 0.0 {
+				(v / d).round().clamp(-7.0, 7.0)
+			} else {
+				0.0
+			};
+			(q as i32 + 8) as u8
+		};
+		c.extend(g.chunks_exact(2).map(|p| q(p[0]) | (q(p[1]) << 4)));
+		s.extend_from_slice(&sc.to_le_bytes());
+	}
+}
+
+/// The routed experts' int4 files (`egu.q4`, `ed.q4` and their `.q4s`),
+/// written unless `q4done` exists: also into an `OUT/mtp` built before
+/// them.
+fn experts_q4(d: &Path, ck: &Checkpoint, say: &mut dyn FnMut(&str)) -> Result<(), String> {
+	if d.join("q4done").exists() {
+		return Ok(());
+	}
+	let m = format!("{L}mlp.");
+	let (mut gc, mut gs, mut dc, mut ds) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+	for e in 0..NE {
+		if e % 64 == 0 {
+			say(&format!("MTP experts int4 {e}..{}", e + 64));
+		}
+		let gu = ck.rows(&format!("{m}experts.gate_up_proj"), e, e + 1)?;
+		let dn = ck.rows(&format!("{m}experts.down_proj"), e, e + 1)?;
+		if gu.len() != 2 * FE * W || dn.len() != W * FE {
+			return Err(format!("MTP expert {e}: unexpected shapes"));
+		}
+		q4(&gu, &mut gc, &mut gs);
+		q4(&dn, &mut dc, &mut ds);
+	}
+	put(d, "egu.q4", &gc)?;
+	put(d, "egu.q4s", &gs)?;
+	put(d, "ed.q4", &dc)?;
+	put(d, "ed.q4s", &ds)?;
+	put(d, "q4done", b"")
 }
 
 fn put(d: &Path, n: &str, b: &[u8]) -> Result<(), String> {
@@ -60,7 +115,7 @@ fn hc(d: &Path, n: &str, h: &Hc) -> Result<(), String> {
 pub fn step_mtp(out: &Path, ck: &Checkpoint, say: &mut dyn FnMut(&str)) -> Result<(), String> {
 	let d = out.join("mtp");
 	if d.join("done").exists() {
-		return Ok(());
+		return experts_q4(&d, ck, say);
 	}
 	if !ck.has(&format!("{P}fc_embedding.weight")) {
 		return Err("the checkpoint has no mtp.* layer".into());
@@ -178,5 +233,6 @@ pub fn step_mtp(out: &Path, ck: &Checkpoint, say: &mut dyn FnMut(&str)) -> Resul
 	put(&d, "egu.s", &gs)?;
 	put(&d, "ed.i8", &dc)?;
 	put(&d, "ed.s", &ds)?;
+	experts_q4(&d, ck, say)?;
 	put(&d, "done", b"")
 }

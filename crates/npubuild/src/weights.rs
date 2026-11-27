@@ -169,7 +169,7 @@ impl Accel {
 
 	/// The inverse Cholesky factor of `hr` on the device; `None` when there
 	/// is none or it failed (the caller then uses the cores).
-	fn inv_chol(&self, hr: &[f32], k: usize) -> Option<Vec<f32>> {
+	pub(crate) fn inv_chol(&self, hr: &[f32], k: usize) -> Option<Vec<f32>> {
 		#[cfg(feature = "vulkan")]
 		{
 			use std::sync::atomic::Ordering;

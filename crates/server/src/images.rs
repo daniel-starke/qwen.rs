@@ -6,7 +6,7 @@
 //! Images routes live here; MCP (`mcp.rs`) runs the same jobs.
 
 use crate::{jstr, respond_json, write_error, Json};
-use imagegen::{ImageSrc, Model, Options, WFmt};
+use imagegen::{ImageModel, ImageSrc, Info, Kind, Options, WFmt};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +20,11 @@ pub(crate) static DEVICES: RwLock<()> = RwLock::new(());
 /// What `--image-model` / `--image-out-dir` / `--image-idle` configure.
 #[derive(Clone, Debug)]
 pub struct ImageCfg {
-	/// The checkpoint directory (`Qwen-Image-2.1-Turbo`, diffusers layout).
+	/// The checkpoint directory (`Qwen-Image-2.1-Turbo` or `MiniMax-H3-Image`,
+	/// diffusers layout) or a Qwen-Image `image.npu`.
 	pub dir: PathBuf,
+	/// The model `dir` holds ([`Kind::of`]).
+	pub kind: Kind,
 	/// Directories an MCP client may write into besides its roots; the first
 	/// is where an unnamed file goes.
 	pub out_dirs: Vec<PathBuf>,
@@ -34,7 +37,7 @@ pub struct ImageCfg {
 static CFG: OnceLock<ImageCfg> = OnceLock::new();
 
 struct Slot {
-	m: Arc<Model>,
+	m: Arc<ImageModel>,
 	last: Instant,
 }
 
@@ -97,8 +100,11 @@ pub fn cfg() -> Option<&'static ImageCfg> {
 	CFG.get()
 }
 
-/// The model id the image routes report.
-pub const IMAGE_MODEL_ID: &str = "qwen-image-2.1-turbo";
+/// What the configured model is ([`Kind::info`]); Qwen-Image's when image
+/// generation is not configured.
+pub fn info() -> Info {
+	cfg().map_or(Kind::QwenImage, |c| c.kind).info()
+}
 
 /// One image job.
 #[derive(Default)]
@@ -141,28 +147,20 @@ fn random_seed() -> u64 {
 	(z ^ (z >> 31)) % 4_294_967_296
 }
 
-/// Sides for a requested aspect at 1 MP (multiples of 32).
+/// Sides for a requested aspect at the model's default area (multiples of
+/// 32).
 pub(crate) fn aspect_size(aspect: &str) -> Result<(usize, usize), String> {
 	let (a, b) = aspect
 		.split_once(':')
 		.and_then(|(a, b)| Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?)))
 		.filter(|(a, b)| *a > 0.0 && *b > 0.0 && a / b <= 4.0 && b / a <= 4.0)
 		.ok_or_else(|| format!("aspect {aspect:?}: want W:H, e.g. 16:9 (at most 4:1)"))?;
-	Ok(imagegen::cond::dims(1024.0 * 1024.0, a / b))
+	Ok(imagegen::cond::dims(info().area as f64, a / b))
 }
 
-/// Check explicit sides: multiples of 32, 256..2048.
+/// Check explicit sides against the model's range ([`Info::check_size`]).
 pub(crate) fn check_size(w: usize, h: usize) -> Result<(usize, usize), String> {
-	if !w.is_multiple_of(32)
-		|| !h.is_multiple_of(32)
-		|| !(256..=2048).contains(&w)
-		|| !(256..=2048).contains(&h)
-	{
-		return Err(format!(
-			"size {w}x{h}: sides must be multiples of 32 between 256 and 2048"
-		));
-	}
-	Ok((w, h))
+	info().check_size(w, h)
 }
 
 /// Run `job` on the loaded (or now loaded) model. `progress(stage, step,
@@ -203,12 +201,13 @@ pub(crate) fn run(
 			Some(s) => (s.m.clone(), None),
 			None => {
 				eprintln!("image: loading {} ({:?})", cfg.dir.display(), cfg.fmt);
-				let m = Arc::new(Model::load(&cfg.dir, cfg.fmt, &mut *progress)?);
+				let m = Arc::new(ImageModel::load(&cfg.dir, cfg.fmt, &mut *progress)?);
 				let (te, dit) = m.resident_bytes();
 				// (the bar may stand on the line: erased first)
 				model::progress::line(&format!(
-					"image: loaded in {:.1} s, transformer on {} (text encoder {:.2} GB, transformer {:.2} GB)",
-					m.load_secs,
+					"image: {} loaded in {:.1} s, transformer on {} (text encoder {:.2} GB, transformer {:.2} GB)",
+					m.info().name,
+					m.load_secs(),
 					m.backend(),
 					te as f64 / 1e9,
 					dit as f64 / 1e9
@@ -217,7 +216,7 @@ pub(crate) fn run(
 					m: m.clone(),
 					last: Instant::now(),
 				});
-				(m.clone(), Some(m.load_secs))
+				(m.clone(), Some(m.load_secs()))
 			}
 		}
 	};
@@ -529,8 +528,8 @@ fn edits_json(body: &[u8]) -> Result<(Job, usize), String> {
 		}
 		job.images.push(image_arg(s)?);
 	}
-	if job.images.is_empty() || job.images.len() > imagegen::MAX_IMAGES {
-		return Err(format!("an edit takes 1..{} images", imagegen::MAX_IMAGES));
+	if job.images.is_empty() || job.images.len() > info().max_images {
+		return Err(format!("an edit takes 1..{} images", info().max_images));
 	}
 	Ok((job, n))
 }
@@ -599,8 +598,8 @@ fn edits_multipart(content_type: &str, body: &[u8]) -> Result<(Job, usize), Stri
 			job.images.push(image_bytes(v)?);
 		}
 	}
-	if job.images.is_empty() || job.images.len() > imagegen::MAX_IMAGES {
-		return Err(format!("an edit takes 1..{} images", imagegen::MAX_IMAGES));
+	if job.images.is_empty() || job.images.len() > info().max_images {
+		return Err(format!("an edit takes 1..{} images", info().max_images));
 	}
 	Ok((job, n))
 }

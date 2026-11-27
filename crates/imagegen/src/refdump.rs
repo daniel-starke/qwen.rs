@@ -1,5 +1,6 @@
-//! Reader for the reference dumps of `scripts/refdump.py` (`NAME.f32` raw
-//! little-endian f32 + `manifest.json`), and the error measure of the gates.
+//! Reader for the reference dumps of `scripts/qimage_refdump.py` and
+//! `scripts/h3refdump.py` (`NAME.f32` raw little-endian f32 +
+//! `manifest.json`), and the error measure of the gates.
 
 use npubuild::st::{parse_json, Json};
 use std::path::{Path, PathBuf};

@@ -40,9 +40,9 @@ none of its code is used.
 | `tokenizer` | Byte-level BPE from the GGUF vocabulary and merges, the chat template, and the streaming decoder. |
 | `sampler` | Temperature, top-k, top-p, min-p, repetition / presence / frequency penalties (on the generated tokens only). |
 | `imgio` / `vision` | Image decoding and resampling, the Qwen3-VL vision tower and projector, and the splicing of an image into a prompt. See [vision.md](vision.md). |
-| `server` | Thread-per-connection HTTP/1.1, a hand-written JSON codec, the two chat APIs, tool use, profiles, MCP and the Images API. No third-party dependencies. See [server.md](server.md). |
+| `server` | Thread-per-connection HTTP/1.1, a hand-written JSON codec, the two chat APIs, tool use, profiles, MCP and the Images API. No third-party runtime dependencies. See [server.md](server.md). |
 | `prefixcache` | The prefix cache of every engine, with states as parts, KV in shared pages, checkpoints, cost-based eviction and the disk tier. |
-| `imagegen` | Qwen-Image-2.1 configs, scheduler, text encoder, transformer and VAE, on the CPU (Q6_K) or the NPU. See [image.md](image.md). |
+| `imagegen` | Image generation: Qwen-Image-2.1 (`qimage`, [image.md](image.md)) and MiniMax-H3-Image (`h3`, [h3image.md](h3image.md)), each with its configs, transformer, VAE and NPU backend, over shared parts at the root (the job interface, the Qwen3-VL text encoder, condition images, ops, weight cache, NPU helpers). |
 | `npu` | The NPU engine through Level Zero (the 27B's in `engine.rs`, Qwen3.8-Flash-Next's in `flash/`), and the SHAVE kernel toolchain (`crates/npu/NPU.md`, `crates/npu/SHAVE-DSL.md`). |
 | `npubuild` | `cli BF16_DIR --npu-build OUT` runs calibration and GPTQ and builds the graph sets the NPU engine loads, for each model (picked by the checkpoint's configs, and also the image model's NPU set). |
 | `ov` | Runs an OpenVINO export through the OpenVINO runtime, which is loaded at run time. Experimental and slower than the NPU engine. |

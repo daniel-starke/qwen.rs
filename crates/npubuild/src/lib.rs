@@ -21,6 +21,8 @@ pub mod g;
 pub mod gptq;
 #[cfg(feature = "vulkan")]
 pub mod gpufac;
+pub mod h3img;
+pub mod h3te;
 pub mod la;
 pub mod lean;
 pub mod qimage;
@@ -37,22 +39,26 @@ use std::path::{Path, PathBuf};
 /// and one of prose. The texts under `calib/` are frozen copies, never edited
 /// with the code (see `calib/README.md`): a changed byte changes the
 /// calibration, and with it every weight the build derives from it.
-pub const CALIB: &str = include_str!("../calib/base.txt");
+pub fn calib() -> &'static str {
+	quant::packed_str!("base.txt")
+}
 
-/// Flash-Next's calibration texts without `--npu-calib`: [`CALIB`], agentic
+/// Flash-Next's calibration texts without `--npu-calib`: [`calib`], agentic
 /// server code and public-domain poetry (English, German, French).
-pub const FLASH_CALIB: &[&str] = &[
-	CALIB,
-	include_str!("../calib/code.txt"),
-	include_str!("../calib/poetry.txt"),
-];
+pub fn flash_calib() -> [&'static str; 3] {
+	[
+		calib(),
+		quant::packed_str!("code.txt"),
+		quant::packed_str!("poetry.txt"),
+	]
+}
 
 pub struct Options {
 	/// The BF16 checkpoint directory.
 	pub src: PathBuf,
 	pub out: PathBuf,
-	/// Calibration text files (empty: the build's built-in texts, [`CALIB`]
-	/// or [`FLASH_CALIB`]).
+	/// Calibration text files (empty: the build's built-in texts, [`calib`]
+	/// or [`flash_calib`]).
 	pub calib: Vec<PathBuf>,
 	/// Calibration chunks of [`weights::CHUNK`] tokens at most.
 	pub max_chunks: usize,
@@ -88,7 +94,9 @@ impl Options {
 
 /// True when `path` is the BF16 checkpoint directory.
 pub fn is_checkpoint(path: &str) -> bool {
-	st::Checkpoint::is_checkpoint(Path::new(path)) || qimage::is_qwen_image(Path::new(path))
+	st::Checkpoint::is_checkpoint(Path::new(path))
+		|| qimage::is_qwen_image(Path::new(path))
+		|| h3img::is_h3(Path::new(path))
 }
 
 pub(crate) fn say(m: &str) {
@@ -190,6 +198,9 @@ pub fn build(o: &Options) -> Result<(), String> {
 	if qimage::is_qwen_image(&o.src) {
 		return qimage::build(o, None);
 	}
+	if h3img::is_h3(&o.src) {
+		return h3img::build(o, None, None);
+	}
 	let ck = st::Checkpoint::open(&o.src)?;
 	mkdir(&o.out)?;
 	if flash::is_flash(&ck) {
@@ -200,7 +211,7 @@ pub fn build(o: &Options) -> Result<(), String> {
 		step_emb(o, &ck)?;
 	}
 	if o.wants("weights") {
-		let chunks = calib_chunks(o, &tok, &[CALIB])?;
+		let chunks = calib_chunks(o, &tok, &[calib()])?;
 		say(&format!(
 			"calibration on {} chunks of {} tokens",
 			chunks.len(),

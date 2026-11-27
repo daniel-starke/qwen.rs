@@ -201,7 +201,7 @@ fn width(lo: i64, hi: i64) -> u32 {
 impl Isa {
 	/// The built-in table.
 	pub fn new() -> Isa {
-		Isa::parse(include_str!("isa.tbl")).expect("isa.tbl")
+		Isa::parse(quant::packed_str!("isa.tbl")).expect("isa.tbl")
 	}
 
 	pub fn parse(text: &str) -> Result<Isa, String> {

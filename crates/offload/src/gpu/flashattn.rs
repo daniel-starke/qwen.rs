@@ -139,10 +139,7 @@ impl FlashAttn {
 	pub fn new(pick: Option<&str>, layers: usize) -> Result<FlashAttn, String> {
 		let dev = GpuDevice::init_pick(pick)?;
 		let main = CString::new("main").unwrap();
-		let sm = create_sm(
-			&dev.device,
-			&load_spv(include_bytes!("../shaders/flash_attn_npu.spv")),
-		)?;
+		let sm = create_sm(&dev.device, &load_spv(quant::packed!("flash_attn_npu.spv")))?;
 		let pl = compute_pipeline(&dev.device, dev.aux_pipeline_layout, sm, &main)?;
 		let sizes = [
 			vk::DescriptorPoolSize {
@@ -171,10 +168,7 @@ impl FlashAttn {
 			vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
 			vk::MemoryPropertyFlags::DEVICE_LOCAL,
 		);
-		let ism = create_sm(
-			&dev.device,
-			&load_spv(include_bytes!("../shaders/idx_score_npu.spv")),
-		)?;
+		let ism = create_sm(&dev.device, &load_spv(quant::packed!("idx_score_npu.spv")))?;
 		let ipl = compute_pipeline(&dev.device, dev.aux_pipeline_layout, ism, &main)?;
 		let ipool = unsafe {
 			dev.device.create_descriptor_pool(

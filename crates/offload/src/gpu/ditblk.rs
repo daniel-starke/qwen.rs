@@ -3,7 +3,7 @@
 //!
 //! WHY
 //! ---
-//! Text to image on the NPU backend (`imagegen::npudit`) is NPU-bound:
+//! Text to image on the NPU backend (`imagegen::qimage::npudit`) is NPU-bound:
 //! the cores' attention takes about a third of each block and the iGPU
 //! idles. Here the iGPU runs the NPU's `dit_mid` job (block l - 1 after its
 //! attention, block l up to its attention) for some row chunks, the
@@ -19,8 +19,8 @@
 //! first use; [`DitBlk::forget_rows`] drops the pass' imports before those
 //! buffers are freed.
 
+use super::hostkern::{HostVec, Rig};
 use super::*;
-use std::collections::HashMap;
 
 const D: usize = 4096;
 const FF: usize = 12288;
@@ -36,8 +36,6 @@ const GU_SG: usize = 3 * D;
 const O_S: usize = 3 * D + FF;
 const D_S: usize = 4 * D + FF;
 const NONE: u32 = !0;
-/// Descriptor sets the pool holds.
-const SETS: usize = 1024;
 
 /// The kernels.
 const K_GEMM: usize = 0;
@@ -46,36 +44,6 @@ const K_ROW1: usize = 2;
 const K_ROW2: usize = 3;
 const K_ACT: usize = 4;
 const K_QKV: usize = 5;
-
-struct Imported {
-	base: usize,
-	len: usize,
-	buf: vk::Buffer,
-	mem: vk::DeviceMemory,
-	rows: bool,
-}
-
-/// A page-aligned host vector of `T`, imported once.
-struct HostVec<T> {
-	v: Vec<T>,
-	off: usize,
-	len: usize,
-}
-
-impl<T: Copy + Default> HostVec<T> {
-	fn new(len: usize) -> HostVec<T> {
-		let sz = std::mem::size_of::<T>();
-		let v = vec![T::default(); len + 4096 / sz];
-		let off = ((v.as_ptr() as usize).next_multiple_of(4096) - v.as_ptr() as usize) / sz;
-		HostVec { v, off, len }
-	}
-	fn s(&self) -> &[T] {
-		&self.v[self.off..self.off + self.len]
-	}
-	fn m(&mut self) -> &mut [T] {
-		&mut self.v[self.off..self.off + self.len]
-	}
-}
 
 /// One `dit_mid` job over rows `r0 .. r1`: block `l - 1` after its
 /// attention and block `l` up to its attention. The slices are the whole
@@ -106,17 +74,7 @@ pub struct DitMid<'a> {
 
 /// See the module docs.
 pub struct DitBlk {
-	dev: GpuDevice,
-	dsl: vk::DescriptorSetLayout,
-	layout: vk::PipelineLayout,
-	sm: Vec<vk::ShaderModule>,
-	pl: Vec<vk::Pipeline>,
-	pool: vk::DescriptorPool,
-	imports: Vec<Imported>,
-	align: usize,
-	sets: HashMap<[usize; 6], vk::DescriptorSet>,
-	/// Submissions in flight (no fence; [`DitBlk::end`] fences them).
-	pending: Vec<vk::CommandBuffer>,
+	rig: Rig,
 	layers: usize,
 	/// per block [`VB`] floats, then the modulation (ms1, mg1, ms2, mg2),
 	/// then a factor per row of a chunk
@@ -133,101 +91,32 @@ impl DitBlk {
 	/// On the Vulkan adapter `pick` names (`"intel"` for the iGPU), for a
 	/// transformer of `layers` blocks.
 	pub fn new(pick: Option<&str>, layers: usize) -> Result<DitBlk, String> {
-		let dev = GpuDevice::init_pick(pick)?;
-		let align = dev
-			.host_import_align()
-			.ok_or("the Vulkan device has no VK_EXT_external_memory_host")?;
-		let d = &dev.device;
-		let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..6)
-			.map(|b| vk::DescriptorSetLayoutBinding {
-				binding: b,
-				descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-				descriptor_count: 1,
-				stage_flags: vk::ShaderStageFlags::COMPUTE,
-				..Default::default()
-			})
-			.collect();
-		let dsl = unsafe {
-			d.create_descriptor_set_layout(
-				&vk::DescriptorSetLayoutCreateInfo {
-					binding_count: bindings.len() as u32,
-					p_bindings: bindings.as_ptr(),
-					..Default::default()
-				},
-				None,
-			)
-		}
-		.map_err(|e| format!("dit block: {e}"))?;
-		let pcr = vk::PushConstantRange {
-			stage_flags: vk::ShaderStageFlags::COMPUTE,
-			offset: 0,
-			size: 32,
-		};
-		let layout = unsafe {
-			d.create_pipeline_layout(
-				&vk::PipelineLayoutCreateInfo {
-					set_layout_count: 1,
-					p_set_layouts: &dsl,
-					push_constant_range_count: 1,
-					p_push_constant_ranges: &pcr,
-					..Default::default()
-				},
-				None,
-			)
-		}
-		.map_err(|e| format!("dit block: {e}"))?;
-		let main = CString::new("main").unwrap();
 		let gemm = match std::env::var_os("QWEN_DIT_GEMM_SPV") {
 			Some(f) => std::fs::read(&f).map_err(|e| format!("{}: {e}", f.to_string_lossy()))?,
-			None => include_bytes!("../shaders/dit_gemm_npu.spv").to_vec(),
+			None => quant::packed!("dit_gemm_npu.spv").to_vec(),
 		};
 		let spvs: [&[u8]; 6] = [
 			&gemm,
-			include_bytes!("../shaders/dit_row0_npu.spv"),
-			include_bytes!("../shaders/dit_row1_npu.spv"),
-			include_bytes!("../shaders/dit_row2_npu.spv"),
-			include_bytes!("../shaders/dit_act_npu.spv"),
-			include_bytes!("../shaders/dit_qkv_npu.spv"),
+			quant::packed!("dit_row0_npu.spv"),
+			quant::packed!("dit_row1_npu.spv"),
+			quant::packed!("dit_row2_npu.spv"),
+			quant::packed!("dit_act_npu.spv"),
+			quant::packed!("dit_qkv_npu.spv"),
 		];
-		let mut sm = Vec::new();
-		let mut pl = Vec::new();
-		for s in spvs {
-			let m = create_sm(d, &load_spv(s))?;
-			pl.push(compute_pipeline(d, layout, m, &main)?);
-			sm.push(m);
-		}
-		let sizes = [vk::DescriptorPoolSize {
-			ty: vk::DescriptorType::STORAGE_BUFFER,
-			descriptor_count: (6 * SETS) as u32,
-		}];
-		let pool = unsafe {
-			d.create_descriptor_pool(
-				&vk::DescriptorPoolCreateInfo {
-					max_sets: SETS as u32,
-					pool_size_count: sizes.len() as u32,
-					p_pool_sizes: sizes.as_ptr(),
-					..Default::default()
-				},
-				None,
-			)
-		}
-		.map_err(|e| format!("dit block descriptor pool: {e}"))?;
+		let mut rig = Rig::new(pick, &spvs, 32, "dit block")?;
+		let vecs = HostVec::new(layers * VB + 4 * D + DIT_CHUNK);
+		let y = HostVec::new(DIT_CHUNK * 2 * FF);
+		let x1 = HostVec::new(DIT_CHUNK * D);
+		let xq = HostVec::new(DIT_CHUNK * FF);
+		rig.own = vec![vecs.range().0, y.range().0, x1.range().0, xq.range().0];
+		rig.keep_lens = vec![D * D, 2 * FF * D, D * FF, 3 * D * D];
 		Ok(DitBlk {
-			dsl,
-			layout,
-			sm,
-			pl,
-			pool,
-			imports: Vec::new(),
-			align,
-			sets: HashMap::new(),
-			pending: Vec::new(),
+			rig,
 			layers,
-			vecs: HostVec::new(layers * VB + 4 * D + DIT_CHUNK),
-			y: HostVec::new(DIT_CHUNK * 2 * FF),
-			x1: HostVec::new(DIT_CHUNK * D),
-			xq: HostVec::new(DIT_CHUNK * FF),
-			dev,
+			vecs,
+			y,
+			x1,
+			xq,
 		})
 	}
 
@@ -252,10 +141,6 @@ impl DitBlk {
 		}
 	}
 
-	/// Submit job `j` (no fence; several may be in flight, in queue order),
-	/// finished by [`DitBlk::end`].
-	/// Nothing may touch rows `r0 .. r1` of `a`, `xo`, `q`, the K / V rows
-	/// or the weights meanwhile.
 	pub fn mid_begin(&mut self, j: &DitMid<'_>) -> Result<(), String> {
 		let rows = j.r1 - j.r0;
 		let ldw_d = j.w_d.len() / D;
@@ -275,82 +160,33 @@ impl DitBlk {
 				j.l, j.r0, j.r1
 			));
 		}
-		let (vecs, y, x1, xq) = (
-			self.vecs.s().as_ptr() as usize,
-			self.y.s().as_ptr() as usize,
-			self.x1.s().as_ptr() as usize,
-			self.xq.s().as_ptr() as usize,
-		);
-		let (lv, ly, lx1, lxq) = (
-			self.vecs.len * 4,
-			self.y.len * 4,
-			self.x1.len * 4,
-			self.xq.len,
+		let (vv, yy, xx1, xxq) = (
+			self.vecs.range(),
+			self.y.range(),
+			self.x1.range(),
+			self.xq.range(),
 		);
 		let p = |s: &[u8]| (s.as_ptr() as usize, s.len());
-		let (vv, yy, xx1, xxq) = ((vecs, lv), (y, ly), (x1, lx1), (xq, lxq));
+		let rig = &mut self.rig;
 		// the sets: bindings 0..6 (unused ones bound to the vectors)
-		let s_row0 = self.set([p(j.a), yy, xx1, vv, xxq, vv])?;
-		let s_row1 = self.set([p(j.x), yy, xx1, vv, xxq, vv])?;
-		let s_row2 = self.set([vv, yy, xx1, vv, xxq, p(j.xo)])?;
-		let s_act = self.set([vv, yy, vv, vv, xxq, vv])?;
-		let s_qkv = self.set([p(j.q), yy, vv, vv, p(j.k), p(j.v)])?;
+		let s_row0 = rig.set([p(j.a), yy, xx1, vv, xxq, vv])?;
+		let s_row1 = rig.set([p(j.x), yy, xx1, vv, xxq, vv])?;
+		let s_row2 = rig.set([vv, yy, xx1, vv, xxq, p(j.xo)])?;
+		let s_act = rig.set([vv, yy, vv, vv, xxq, vv])?;
+		let s_qkv = rig.set([p(j.q), yy, vv, vv, p(j.k), p(j.v)])?;
 		let mut s_w = [vk::DescriptorSet::null(); 4];
 		for (i, w) in [j.w_o, j.w_gu, j.w_d, j.w_qkv].into_iter().enumerate() {
-			s_w[i] = self.set([p(w), xxq, yy, vv, vv, vv])?;
+			s_w[i] = rig.set([p(w), xxq, yy, vv, vv, vv])?;
 		}
 		let (lp, lq) = ((j.l - 1) * VB, j.l * VB);
 		let mods = self.layers * VB;
 		let (ms1, mg1, ms2, mg2) = (mods, mods + D, mods + 2 * D, mods + 3 * D);
 		let rowf = mods + 4 * D;
-		let d = &self.dev.device;
-		let (pl, layout) = (&self.pl, self.layout);
-		let rec = |cmd: vk::CommandBuffer| unsafe {
-			use vk::{AccessFlags as A, PipelineStageFlags as P};
-			let bar = |a, b, sa, da| {
-				d.cmd_pipeline_barrier(
-					cmd,
-					a,
-					b,
-					vk::DependencyFlags::empty(),
-					&[vk::MemoryBarrier {
-						src_access_mask: sa,
-						dst_access_mask: da,
-						..Default::default()
-					}],
-					&[],
-					&[],
-				)
+		let u = |x: usize| x as u32;
+		rig.submit(|rig, cmd| {
+			let step = |k: usize, set, pc: [u32; 8], gx: usize, gy: usize| {
+				rig.dispatch(cmd, k, set, &pc, gx, gy)
 			};
-			let step = |k: usize, set: vk::DescriptorSet, pc: [u32; 8], gx: usize, gy: usize| {
-				d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pl[k]);
-				d.cmd_bind_descriptor_sets(
-					cmd,
-					vk::PipelineBindPoint::COMPUTE,
-					layout,
-					0,
-					&[set],
-					&[],
-				);
-				let b: Vec<u8> = pc.iter().flat_map(|x| x.to_le_bytes()).collect();
-				d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &b);
-				d.cmd_dispatch(cmd, gx as u32, gy as u32, 1);
-				bar(
-					P::COMPUTE_SHADER,
-					P::COMPUTE_SHADER,
-					A::SHADER_WRITE,
-					A::SHADER_READ | A::SHADER_WRITE,
-				);
-			};
-			// after the host's writes and the submissions before this one
-			// (they share the scratch vectors)
-			bar(
-				P::HOST | P::COMPUTE_SHADER,
-				P::COMPUTE_SHADER,
-				A::HOST_WRITE | A::SHADER_WRITE,
-				A::SHADER_READ | A::SHADER_WRITE,
-			);
-			let u = |x: usize| x as u32;
 			let mut r = j.r0;
 			while r < j.r1 {
 				let n = (j.r1 - r).min(DIT_CHUNK);
@@ -413,167 +249,19 @@ impl DitBlk {
 				);
 				r += n;
 			}
-			// the NPU and the cores read the rows from host memory after the
-			// fence
-			bar(P::COMPUTE_SHADER, P::HOST, A::SHADER_WRITE, A::HOST_READ);
-		};
-		let _ = mg1;
-		let cmd = self
-			.dev
-			.record_cmd(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT, rec);
-		if let Err(e) = self.dev.submit_cmd_nofence(cmd) {
-			unsafe { d.free_command_buffers(self.dev.cmd_pool, &[cmd]) };
-			return Err(format!("dit block: {e}"));
-		}
-		self.pending.push(cmd);
-		Ok(())
+		})
+		.map_err(|e| format!("dit block: {e}"))
 	}
 
-	/// Wait for the submissions in flight (none: Ok): an empty one on the
-	/// fence after them (a fence covers every earlier submission).
+	/// Wait for the submissions in flight.
 	pub fn end(&mut self) -> Result<(), String> {
-		if self.pending.is_empty() {
-			return Ok(());
-		}
-		let r = match self.dev.submit_nowait(|_| {}) {
-			Ok(cmd) => self.dev.wait_submitted(cmd),
-			Err(e) => {
-				unsafe { self.dev.device.queue_wait_idle(self.dev.queue).ok() };
-				Err(e)
-			}
-		};
-		let cmds: Vec<vk::CommandBuffer> = std::mem::take(&mut self.pending);
-		unsafe {
-			self.dev
-				.device
-				.free_command_buffers(self.dev.cmd_pool, &cmds)
-		};
-		r.map_err(|e| format!("dit block: {e}"))
+		self.rig.end()
 	}
 
 	/// Drop the imports of the pass' buffers (before they are freed); the
 	/// weights' and the own buffers' stay.
 	pub fn forget_rows(&mut self) {
-		let _ = self.end();
-		let d = &self.dev.device;
-		unsafe {
-			let _ = d.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty());
-		}
-		self.sets.clear();
-		let mut keep = Vec::new();
-		for e in self.imports.drain(..) {
-			if e.rows {
-				unsafe { hostimp::free_import(d, e.buf, e.mem) };
-			} else {
-				keep.push(e);
-			}
-		}
-		self.imports = keep;
-	}
-
-	/// The descriptor set over host ranges `b` (bindings 0..6).
-	fn set(&mut self, b: [(usize, usize); 6]) -> Result<vk::DescriptorSet, String> {
-		let key = b.map(|x| x.0);
-		if let Some(s) = self.sets.get(&key) {
-			return Ok(*s);
-		}
-		if self.sets.len() == SETS {
-			// the sets of the submissions in flight go with the pool
-			self.end()?;
-			unsafe {
-				self.dev
-					.device
-					.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty())
-			}
-			.map_err(|e| format!("dit block: {e}"))?;
-			self.sets.clear();
-		}
-		let mut infos = [vk::DescriptorBufferInfo::default(); 6];
-		for (i, &(ptr, len)) in b.iter().enumerate() {
-			let (buf, off) = self.import(ptr, len)?;
-			infos[i] = vk::DescriptorBufferInfo {
-				buffer: buf,
-				offset: off,
-				range: len as u64,
-			};
-		}
-		let d = &self.dev.device;
-		let set = unsafe {
-			d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo {
-				descriptor_pool: self.pool,
-				descriptor_set_count: 1,
-				p_set_layouts: &self.dsl,
-				..Default::default()
-			})
-		}
-		.map_err(|e| format!("dit block descriptor set: {e}"))?[0];
-		let writes: Vec<vk::WriteDescriptorSet> = (0..6)
-			.map(|i| vk::WriteDescriptorSet {
-				dst_set: set,
-				dst_binding: i as u32,
-				descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-				descriptor_count: 1,
-				p_buffer_info: &infos[i],
-				..Default::default()
-			})
-			.collect();
-		unsafe { d.update_descriptor_sets(&writes, &[]) };
-		self.sets.insert(key, set);
-		Ok(set)
-	}
-
-	/// A buffer over host bytes `[ptr, ptr + len)` and `ptr`'s offset in it,
-	/// importing the covering pages on first use. Weights (int8 matrices)
-	/// and the own buffers are kept across passes.
-	fn import(&mut self, ptr: usize, len: usize) -> Result<(vk::Buffer, u64), String> {
-		let a = self.align;
-		let (base, end) = (ptr & !(a - 1), (ptr + len + a - 1) & !(a - 1));
-		if let Some(e) = self
-			.imports
-			.iter()
-			.find(|e| e.base <= base && end <= e.base + e.len)
-		{
-			return Ok((e.buf, (ptr - e.base) as u64));
-		}
-		let own = [
-			self.vecs.s().as_ptr() as usize,
-			self.y.s().as_ptr() as usize,
-			self.x1.s().as_ptr() as usize,
-			self.xq.s().as_ptr() as usize,
-		];
-		let weight = [D * D, 2 * FF * D, D * FF, 3 * D * D].contains(&len);
-		let (buf, mem) = self.dev.import_host_range(base, end - base)?;
-		self.imports.push(Imported {
-			base,
-			len: end - base,
-			buf,
-			mem,
-			rows: !weight && !own.contains(&ptr),
-		});
-		Ok((buf, (ptr - base) as u64))
-	}
-}
-
-impl Drop for DitBlk {
-	fn drop(&mut self) {
-		let _ = self.end();
-		let d = &self.dev.device;
-		unsafe {
-			let _ = d.device_wait_idle();
-			let _ = d.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty());
-			for e in self.imports.drain(..) {
-				hostimp::free_import(d, e.buf, e.mem);
-			}
-			for &p in &self.pl {
-				d.destroy_pipeline(p, None);
-			}
-			for &m in &self.sm {
-				d.destroy_shader_module(m, None);
-			}
-			d.destroy_descriptor_pool(self.pool, None);
-			d.destroy_pipeline_layout(self.layout, None);
-			d.destroy_descriptor_set_layout(self.dsl, None);
-		}
+		self.rig.forget_rows()
 	}
 }
 

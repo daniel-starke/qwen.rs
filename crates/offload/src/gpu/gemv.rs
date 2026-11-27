@@ -11,14 +11,17 @@
 //! region: the host's activation is copied to VRAM first, the results are
 //! written straight into a host-visible buffer.
 //!
-//! Matrices are sub-allocated from 256 MB blocks (hundreds of separate
-//! allocations next to gigabytes of weights lost the device once); each carries its own descriptor set and parameters, so a
-//! run only records dispatches.
+//! Matrices are sub-allocated from blocks of at most 256 MB (hundreds of
+//! separate allocations next to gigabytes of weights lost the device once),
+//! first fit, a new block sized to what `need` has left; each carries its
+//! own descriptor set and parameters, so a run only records dispatches.
 
 use super::*;
 
-/// VRAM block size for the matrices.
+/// The largest VRAM block for the matrices.
 const BLOCK: u64 = 256 << 20;
+/// The smallest one, and its rounding.
+const BLOCK_MIN: u64 = 4 << 20;
 /// Host input / output regions, in floats.
 pub const GEMV_X: usize = 65536;
 pub const GEMV_Y: usize = 262144;
@@ -96,9 +99,10 @@ pub struct Gemv {
 	layout: vk::PipelineLayout,
 	pool: vk::DescriptorPool,
 	bufs: Vec<(vk::Buffer, vk::DeviceMemory)>,
-	/// VRAM blocks and the bytes used of the last one
-	blocks: Vec<vk::Buffer>,
-	used: u64,
+	/// VRAM blocks: buffer, size, bytes used
+	blocks: Vec<(vk::Buffer, u64, u64)>,
+	/// the bytes [`Self::new`] was asked for: sizes the last blocks
+	need: u64,
 	params: vk::Buffer,
 	stage: (vk::Buffer, *mut u8),
 	xin: (vk::Buffer, *mut f32),
@@ -165,35 +169,35 @@ impl Gemv {
 		// without a (working) integer dot product the int8 kernel takes Q8
 		let dp4a = dev.pipeline_gemm_q4k_dp4a.is_some();
 		let q8: &[u8] = if dp4a {
-			include_bytes!("../shaders/gemv_q8.spv")
+			quant::packed!("gemv_q8.spv")
 		} else {
-			include_bytes!("../shaders/gemv_i8.spv")
+			quant::packed!("gemv_i8.spv")
 		};
 		let (q8_2, q8_4): (&[u8], &[u8]) = if dp4a {
 			(
-				include_bytes!("../shaders/gemv_q8_2.spv"),
-				include_bytes!("../shaders/gemv_q8_4.spv"),
+				quant::packed!("gemv_q8_2.spv"),
+				quant::packed!("gemv_q8_4.spv"),
 			)
 		} else {
 			(
-				include_bytes!("../shaders/gemv_i8_2.spv"),
-				include_bytes!("../shaders/gemv_i8_4.spv"),
+				quant::packed!("gemv_i8_2.spv"),
+				quant::packed!("gemv_i8_4.spv"),
 			)
 		};
 		let sm = [
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_i8.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_f16.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_act.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_vec.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_i8_1.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_f16_1.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_i8.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_f16.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_act.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_vec.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_i8_1.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_f16_1.spv")))?,
 			create_sm(d, &load_spv(q8))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_delta.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_i8_2.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_f16_2.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_delta.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_i8_2.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_f16_2.spv")))?,
 			create_sm(d, &load_spv(q8_2))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_i8_4.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/gemv_f16_4.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_i8_4.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("gemv_f16_4.spv")))?,
 			create_sm(d, &load_spv(q8_4))?,
 		];
 		// the run's positions and its first position slot (read by the delta
@@ -298,7 +302,7 @@ impl Gemv {
 			layout,
 			pool,
 			blocks: Vec::new(),
-			used: BLOCK,
+			need,
 			params: params.0,
 			stage: (stage.0, sp),
 			xin: (xin.0, xp),
@@ -410,26 +414,33 @@ impl Gemv {
 		self.bytes
 	}
 
-	/// Room for `bytes` in a block: (buffer, offset).
+	/// Room for `bytes`: (buffer, offset) in the first block with room,
+	/// else in a new one of [`BLOCK`] or, near the end, of what `need` has
+	/// left (a last block of full size would leave most of it unused).
 	fn place(&mut self, bytes: u64) -> Result<(vk::Buffer, u64), String> {
 		let a = self.align;
-		let off = self.used.div_ceil(a) * a;
-		if off + bytes > BLOCK || self.blocks.is_empty() {
-			let b = self
-				.dev
-				.try_create_gpu_buffer(
-					BLOCK,
-					vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-					vk::MemoryPropertyFlags::DEVICE_LOCAL,
-				)
-				.ok_or("gemv: VRAM allocation failed")?;
-			self.bufs.push(b);
-			self.blocks.push(b.0);
-			self.used = bytes;
-			return Ok((b.0, 0));
+		for (buf, size, used) in self.blocks.iter_mut() {
+			let off = used.div_ceil(a) * a;
+			if off + bytes <= *size {
+				*used = off + bytes;
+				return Ok((*buf, off));
+			}
 		}
-		self.used = off + bytes;
-		Ok((*self.blocks.last().unwrap(), off))
+		let left = self.need.saturating_sub(self.bytes) + BLOCK_MIN;
+		let size = (left.div_ceil(BLOCK_MIN) * BLOCK_MIN)
+			.min(BLOCK)
+			.max(bytes.div_ceil(a) * a);
+		let b = self
+			.dev
+			.try_create_gpu_buffer(
+				size,
+				vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+				vk::MemoryPropertyFlags::DEVICE_LOCAL,
+			)
+			.ok_or("gemv: VRAM allocation failed")?;
+		self.bufs.push(b);
+		self.blocks.push((b.0, size, bytes));
+		Ok((b.0, 0))
 	}
 
 	/// Copy `data` to `dst` at `off` through the staging buffer.

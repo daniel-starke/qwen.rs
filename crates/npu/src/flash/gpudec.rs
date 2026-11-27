@@ -431,9 +431,9 @@ fn i8_names(l: usize) -> Vec<&'static str> {
 }
 
 impl GpuDec {
-	/// VRAM bytes the weights in `wdir` will take.
-	/// `head`: with the int8 lm_head.
-	pub fn need(wdir: &Path, head: bool) -> Result<u64, String> {
+	/// VRAM bytes the weights in `wdir` will take, with `head_rows` rows
+	/// of the int8 lm_head.
+	pub fn need(wdir: &Path, head_rows: usize) -> Result<u64, String> {
 		let len = |p: std::path::PathBuf| {
 			std::fs::metadata(&p)
 				.map(|m| m.len())
@@ -449,9 +449,7 @@ impl GpuDec {
 				n += len(wdir.join(format!("fl{l}.{m}.in")))?;
 			}
 		}
-		if head {
-			n += (super::VOCAB * (W + 4)) as u64;
-		}
+		n += (head_rows * (W + 4)) as u64;
 		if mix_gpu() {
 			n += (NL - NL / 4) as u64 * DMIX_BYTES;
 		}
@@ -782,10 +780,12 @@ impl GpuDec {
 		})
 	}
 
-	/// Upload the int8 lm_head: codes `[VOCAB][W]`, row scales.
-	pub fn add_head(&mut self, c: &[i8], s: &[f32]) -> Result<(), String> {
-		for r0 in (0..super::VOCAB).step_by(HEAD_ROWS) {
-			let n = HEAD_ROWS.min(super::VOCAB - r0);
+	/// Upload the int8 lm_head's first `rows` rows (codes `[VOCAB][W]`,
+	/// row scales).
+	pub fn add_head(&mut self, c: &[i8], s: &[f32], rows: usize) -> Result<(), String> {
+		let rows = rows.min(super::VOCAB);
+		for r0 in (0..rows).step_by(HEAD_ROWS) {
+			let n = HEAD_ROWS.min(rows - r0);
 			let m = Mat::I8(&c[r0 * W..(r0 + n) * W], &s[r0..r0 + n]);
 			self.head.push(self.g.add(m, n, W, X0, r0)?);
 		}
@@ -803,6 +803,9 @@ impl GpuDec {
 	pub fn head_n(&mut self, ms: &[&[f32]]) -> Result<Option<Vec<Vec<f32>>>, String> {
 		if self.head.is_empty() {
 			return Ok(None);
+		}
+		if self.head.len() * HEAD_ROWS < super::VOCAB {
+			return Err("gpudec: the GPU holds only part of the lm_head".into());
 		}
 		let ids = self.head.clone();
 		self.run_n(ms, &ids)?;

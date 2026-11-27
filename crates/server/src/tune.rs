@@ -8,7 +8,7 @@
 //!
 //! - **Workload.** One agentic conversation: a coding-agent system prompt,
 //!   six tools (Read, Edit, Write, Bash, Grep, Glob), a task, then Read
-//!   calls whose results are source files (the embedded [`CORPUS`] of this
+//!   calls whose results are source files (the embedded corpus of this
 //!   repository's larger sources, or `--tune-corpus DIR`). It grows to each
 //!   depth of `--tune-depths` (default: the base prompt, 16k, 64k and the
 //!   context less the decode); at each depth the last tool result carries a
@@ -71,84 +71,24 @@ pub(crate) fn take() -> Option<TuneOpts> {
 const MARGIN: f64 = 0.02;
 
 /// Source files the tool results show, embedded so the tuner needs nothing
-/// beside the binary: ~1.1 MB of Rust, ~330k tokens.
-const CORPUS: &[(&str, &str)] = &[
-	("crates/server/src/lib.rs", include_str!("lib.rs")),
-	("crates/server/src/openai.rs", include_str!("openai.rs")),
-	("crates/server/src/tools.rs", include_str!("tools.rs")),
-	(
-		"crates/prefixcache/src/lib.rs",
-		include_str!("../../prefixcache/src/lib.rs"),
-	),
-	(
-		"crates/model/src/forward.rs",
-		include_str!("../../model/src/forward.rs"),
-	),
-	(
-		"crates/model/src/mtp.rs",
-		include_str!("../../model/src/mtp.rs"),
-	),
-	(
-		"crates/model/src/dflash.rs",
-		include_str!("../../model/src/dflash.rs"),
-	),
-	(
-		"crates/model/src/suffix.rs",
-		include_str!("../../model/src/suffix.rs"),
-	),
-	(
-		"crates/tokenizer/src/lib.rs",
-		include_str!("../../tokenizer/src/lib.rs"),
-	),
-	(
-		"crates/quant/src/linear.rs",
-		include_str!("../../quant/src/linear.rs"),
-	),
-	(
-		"crates/quant/src/parallel.rs",
-		include_str!("../../quant/src/parallel.rs"),
-	),
-	(
-		"crates/offload/src/manager.rs",
-		include_str!("../../offload/src/manager.rs"),
-	),
-	(
-		"crates/offload/src/gpu/device.rs",
-		include_str!("../../offload/src/gpu/device.rs"),
-	),
-	(
-		"crates/offload/src/gpu/stream.rs",
-		include_str!("../../offload/src/gpu/stream.rs"),
-	),
-	(
-		"crates/offload/src/gpu/gemv.rs",
-		include_str!("../../offload/src/gpu/gemv.rs"),
-	),
-	(
-		"crates/offload/src/gpu/matmul.rs",
-		include_str!("../../offload/src/gpu/matmul.rs"),
-	),
-	(
-		"crates/offload/src/gpu/attn.rs",
-		include_str!("../../offload/src/gpu/attn.rs"),
-	),
-	(
-		"crates/npu/src/engine.rs",
-		include_str!("../../npu/src/engine.rs"),
-	),
-	(
-		"crates/npu/src/flash/engine.rs",
-		include_str!("../../npu/src/flash/engine.rs"),
-	),
-	(
-		"crates/npu/src/flash/gpudec.rs",
-		include_str!("../../npu/src/flash/gpudec.rs"),
-	),
-	(
-		"crates/ov/src/stateless.rs",
-		include_str!("../../ov/src/stateless.rs"),
-	),
-];
+/// beside the binary: ~1.1 MB of Rust, ~330k tokens, deflated by
+/// `build.rs` (the file list is there). (path, text) per file.
+fn embedded_corpus() -> Vec<(String, String)> {
+	let mut rest = quant::packed!("corpus.bin");
+	let take = |rest: &mut &[u8]| {
+		let (n, r) = rest.split_at(4);
+		let n = u32::from_le_bytes(n.try_into().unwrap()) as usize;
+		let (s, r) = r.split_at(n);
+		*rest = r;
+		String::from_utf8(s.to_vec()).expect("embedded corpus")
+	};
+	let mut out = Vec::new();
+	while !rest.is_empty() {
+		let path = take(&mut rest);
+		out.push((path, take(&mut rest)));
+	}
+	out
+}
 
 const SYSTEM: &str = "You are a coding agent working in a user's repository. You \
 help with software engineering tasks: reading and changing code, running commands, \
@@ -439,13 +379,10 @@ impl Conv {
 }
 
 /// The tool-result files: `dir`'s text sources (sorted, skipping build
-/// output), else [`CORPUS`].
+/// output), else the embedded corpus.
 fn corpus(dir: Option<&Path>) -> Result<Vec<(String, String)>, String> {
 	let Some(dir) = dir else {
-		return Ok(CORPUS
-			.iter()
-			.map(|(p, t)| (p.to_string(), t.to_string()))
-			.collect());
+		return Ok(embedded_corpus());
 	};
 	let exts = [
 		"rs", "py", "c", "h", "cc", "cpp", "hpp", "js", "ts", "go", "java", "md", "toml", "glsl",
@@ -906,6 +843,16 @@ fn write(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn embedded_corpus_unpacks_to_the_sources() {
+		let c = embedded_corpus();
+		assert_eq!(c.len(), 21);
+		assert_eq!(c[0].0, "crates/server/src/lib.rs");
+		assert_eq!(c[0].1, include_str!("lib.rs"));
+		assert_eq!(c[20].0, "crates/ov/src/stateless.rs");
+		assert_eq!(c[20].1, include_str!("../../ov/src/stateless.rs"));
+	}
 
 	#[test]
 	fn knob_grids_hold_the_defaults_range() {

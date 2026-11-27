@@ -135,10 +135,48 @@ fn qlin(g: &mut Graph, x: &V, w: &str, n: usize, k: usize) -> V {
 /// [`qlin`] without the row scale `{w}.s` (`scale` false: applied or
 /// folded elsewhere) and, for [`Act::Dynamic`], without the rotation's
 /// signs (`signs` false: folded into the rows that produce `x`).
-fn qlin_f(g: &mut Graph, x: &V, w: &str, n: usize, k: usize, scale: bool, signs: bool) -> V {
-	let (ty, e) = if w4() { (Ty::I4, -3) } else { (Ty::I8, -7) };
+pub(crate) fn qlin_f(
+	g: &mut Graph,
+	x: &V,
+	w: &str,
+	n: usize,
+	k: usize,
+	scale: bool,
+	signs: bool,
+) -> V {
+	qlin_ty(
+		g,
+		x,
+		w,
+		n,
+		k,
+		scale,
+		signs,
+		if w4() { Ty::I4 } else { Ty::I8 },
+		false,
+	)
+}
+
+/// [`qlin_f`] with the codes' type `ty` (`I8`: x 2^-7; `I4`: x 2^-3, and
+/// a per-row activation without the [`rowq`] kernel). A per-row
+/// activation's MatMul output takes the row maximum before the row scale
+/// when `max_first` (row scales far above 1 overflow f16 in between).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qlin_ty(
+	g: &mut Graph,
+	x: &V,
+	w: &str,
+	n: usize,
+	k: usize,
+	scale: bool,
+	signs: bool,
+	ty: Ty,
+	max_first: bool,
+) -> V {
+	let e = if ty == Ty::I4 { -3 } else { -7 };
+	let rowq = rowq() && ty == Ty::I8;
 	// [`rowq`]: the codes carry zero columns for the kernel's pad lanes
-	let kc = if act(w) == Act::Dynamic && rowq() {
+	let kc = if act(w) == Act::Dynamic && rowq {
 		k + ROWQ_PAD
 	} else {
 		k
@@ -170,7 +208,7 @@ fn qlin_f(g: &mut Graph, x: &V, w: &str, n: usize, k: usize, scale: bool, signs:
 		x.clone()
 	};
 	let t = crate::flash::graphs::rotate(g, &t, ROT);
-	if rowq() {
+	if rowq {
 		// `shave/rowq.sk` (carrier SoftMax): the scaled row and its max
 		// in ROWQ_PAD pad lanes; the MatMul reads the pad lanes against
 		// zero columns, so the quantized tensor is never sliced
@@ -181,10 +219,15 @@ fn qlin_f(g: &mut Graph, x: &V, w: &str, n: usize, k: usize, scale: bool, signs:
 		let m = g.slice(&y, k, k + 1, 1, 2);
 		let yq = g.fake_quantize(&y, -1.0, 127.0 / 128.0, 256);
 		let y = g.matmul(&yq, &c, false, true);
-		let y = rs(g, y);
 		let iq = g.s16(128.0 / 127.0);
 		let m = g.mul(&m, &iq);
-		return g.mul(&y, &m);
+		return if max_first {
+			let y = g.mul(&y, &m);
+			rs(g, y)
+		} else {
+			let y = rs(g, y);
+			g.mul(&y, &m)
+		};
 	}
 	let a = g.abs(&t);
 	let m = g.reduce_max(&a, -1);
@@ -195,10 +238,15 @@ fn qlin_f(g: &mut Graph, x: &V, w: &str, n: usize, k: usize, scale: bool, signs:
 	let t = g.mul(&t, &r);
 	let tq = g.fake_quantize(&t, -1.0, 127.0 / 128.0, 256);
 	let y = g.matmul(&tq, &c, false, true);
-	let y = rs(g, y);
 	let iq = g.s16(128.0 / 127.0);
 	let m = g.mul(&m, &iq);
-	g.mul(&y, &m)
+	if max_first {
+		let y = g.mul(&y, &m);
+		rs(g, y)
+	} else {
+		let y = rs(g, y);
+		g.mul(&y, &m)
+	}
 }
 
 /// The folded form (default; `QWEN_IMAGE_FOLD=0` at build time is the A/B,
@@ -211,7 +259,7 @@ fn qlin_f(g: &mut Graph, x: &V, w: &str, n: usize, k: usize, scale: bool, signs:
 ///   u` needs neither the signs Multiply nor the up half's scale.
 /// - **`q` / `k` / `v` raw**: the MatMul's output before its row scale;
 ///   the cores apply `q` / `k`'s row scales (`qkv.s`), head norms (`nq`,
-///   `nk`) and RoPE in f32 (`imagegen::npudit`), and `v`'s row scales are
+///   `nk`) and RoPE in f32 (`imagegen::qimage::npudit`), and `v`'s row scales are
 ///   folded into `o.pre` (a per-channel factor of V passes through the
 ///   attention unchanged). No `cos` / `sin` inputs.
 ///
@@ -461,7 +509,7 @@ struct P<T>(*mut T);
 unsafe impl<T> Send for P<T> {}
 unsafe impl<T> Sync for P<T> {}
 
-fn f16v(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f16v(v: &[f32]) -> Vec<u8> {
 	v.iter()
 		.flat_map(|&x| crate::g::f16_bits(x as f64).to_le_bytes())
 		.collect()
@@ -475,7 +523,7 @@ pub fn f16f(b: &[u8]) -> Vec<f32> {
 }
 
 /// The f16 product of an f16 vector (bytes) and `b`.
-fn mulf16(a: &[u8], b: &[f32]) -> Vec<u8> {
+pub(crate) fn mulf16(a: &[u8], b: &[f32]) -> Vec<u8> {
 	let v: Vec<f32> = f16f(a).iter().zip(b).map(|(x, y)| x * y).collect();
 	f16v(&v)
 }

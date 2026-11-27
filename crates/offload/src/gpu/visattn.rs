@@ -72,10 +72,10 @@ impl VisAttn {
 			.ok_or("the Vulkan device has no VK_EXT_external_memory_host")?;
 		let main = CString::new("main").unwrap();
 		let spv: [&[u8]; 4] = [
-			include_bytes!("../shaders/vis_rope_npu.spv"),
-			include_bytes!("../shaders/vis_qk_npu.spv"),
-			include_bytes!("../shaders/vis_sm_npu.spv"),
-			include_bytes!("../shaders/vis_pv_npu.spv"),
+			quant::packed!("vis_rope_npu.spv"),
+			quant::packed!("vis_qk_npu.spv"),
+			quant::packed!("vis_sm_npu.spv"),
+			quant::packed!("vis_pv_npu.spv"),
 		];
 		let mut sm = [vk::ShaderModule::null(); 4];
 		let mut pl = [vk::Pipeline::null(); 4];

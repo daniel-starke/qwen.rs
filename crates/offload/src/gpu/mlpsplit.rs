@@ -82,8 +82,8 @@ impl MlpSplit {
 		let d = &dev.device;
 		let main = CString::new("main").unwrap();
 		let sm = [
-			create_sm(d, &load_spv(include_bytes!("../shaders/i4_dp4a.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/mlp_act.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("i4_dp4a.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("mlp_act.spv")))?,
 		];
 		let pl = [
 			compute_pipeline(d, dev.aux_pipeline_layout, sm[0], &main)?,

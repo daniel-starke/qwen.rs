@@ -167,6 +167,15 @@ Other prefill passes:
   short pieces took the expert pass -27 % (Flash).
 - **Run VAE-style convolutions as halo tiles on the NPU**, with norms on the
   cores, 2.9x (Image).
+- **Batch a ViT decoder's tiles into fixed-shape NPU graphs**, one graph per
+  layer over several tiles with the attention inside, norms and residual
+  scales folded into f16 weights: 2x over the cores, output within 0.5 % (Image, H3).
+- **Order rows by modulation entry.** When rows of one sequence take
+  different per-row modulation, group them by entry and pad each group to
+  whole jobs; full attention ignores the keys' order (Image, H3).
+- **Bound the executions recorded at once.** Too many appended graph
+  executions exhaust the driver's descriptor memory; keep a window of
+  lists alive (Image, H3).
 
 ## Low-precision accuracy
 
@@ -175,6 +184,14 @@ Other prefill passes:
   (NPU).
 - **Rotate before quantizing.** Int4 per-row GPTQ on block-Hadamard-rotated
   weights is faster than the grouped export, with about half the KL (NPU).
+- **GPTQ pays for int8 weights too, in the free-running output.** On a
+  diffusion transformer with static int8 activations it cut the block
+  errors only 3-7 % and left the per-step error unchanged, but the
+  free-running image moved about +2.6 dB closer to the reference and a
+  large one +1.3 dB closer to the Q6_K backend's: the weight errors
+  compound over the steps. The Hessians of all blocks' inputs are
+  collected in one calibration pass as packed lower triangles (half the
+  memory) (H3).
 - **Use calibrated static int8 ranges** folded into norm weights and row scales,
   which removes per-token rescale passes, +43 % for +9 % KL (NPU).
 - **Calibrate on frozen texts of several kinds, and judge on a long text.** Mixing
@@ -183,10 +200,16 @@ Other prefill passes:
   a short one, so a short text alone misjudges a calibration (Flash).
 - **Bound every intermediate of an f16 computation.** A chunked (WY) gated delta
   rule with a blocked inverse keeps all intermediates in range, about 18x lower
-  KL than a Neumann product whose partial products overflowed (NPU).
+  KL than a Neumann product whose partial products overflowed (NPU). Order the
+  rescales of a per-row-quantized matmul by size: a text encoder whose early
+  layers' folded row scales were ~60x a transformer's overflowed to inf until
+  the row maximum was applied before the row scale (H3).
 - **Guard f16 range on the NPU.** Floor epsilons, pre-scale l2 norms by max-abs,
   accumulate cumulative sums in fp32, and scale up subnormals the device flushes
   (NPU).
+- **Store a residual stream that exceeds f16 at a calibrated scale per
+  block.** Fold `gate / c_l` into the projections' row scales and make the
+  step between blocks one multiply; RMSNorms ignore the scale (Image, H3).
 - **Keep several scales per group.** One scale per stream lost visible KL on the
   hyper-connections (Flash).
 - **Center keys cheaply.** A softmax ignores per-channel key offsets, so the
@@ -194,18 +217,41 @@ Other prefill passes:
 
 ## Memory and data movement
 
+Binary:
+- **Deflate large embedded data, inflate on first use.** SPIR-V, instruction
+  tables, calibration texts and an embedded source corpus shrink 3-10x with
+  the deflate the image decoders link anyway; read-only data falls by more
+  than half and the shipped binary by about a sixth, at a few ms of
+  inflation per item when first used.
+- **Enable only the Unicode tables a regex uses.** A pre-tokenizer needs
+  general categories and Perl classes; the full table set is twice as large.
+
 Host:
+- **Read a tiled stage's weights once per run, not per tile**, 3.5x on a
+  ViT VAE decoder on the cores (Image, H3).
 - **Recycle large blocks.** The Windows heap returned every large buffer to the
   OS and each layer re-faulted it, +40 % prefill (GGUF).
 - **Read large weight files unbuffered and in parallel.** The file cache pushed
   out pinned pages. A few readers saturate the NVMe, and both fewer and more were
   slower, about 4x on load (Flash).
+- **Convert a table block by block while reading it.** Reading the whole file
+  and converting it afterwards held the source twice beside the result. Reading
+  in row blocks gives the same codes with about -3 % peak load memory and half
+  the table's load time (Flash lm_head to int8).
 - **Give parallel readers their own file handles.** Windows serializes
   synchronous reads on one handle, over 1000x on cold rows (Flash).
 - **Write buffers once, where they are read.** Bind outputs at their consumer's
   slot and remove zero fills that the next write overwrites. Mostly speed
   neutral, with -7-11 % host wait on the NPU (Flash), -10 % on a decode step
   (Flash) and -4 % on the VAE (Image).
+- **Keep only the host's share of a table another device also holds.** With
+  the lm_head on the GPU, the host keeps just the rows it computes beside it and
+  reads the rest back if the GPU is lost: about -0.5 % memory, speed and
+  accuracy unchanged (Flash).
+- **Load rarely used graphs on first use.** The vision tower's graphs (blobs
+  and the driver's copies) loaded at startup for every chat; loaded with the
+  first image they cost about -2.5 % peak memory of a text session and one
+  short load on the first image (Flash).
 - **Keep threads persistent** instead of spawning them per step (Flash).
 - **Store long-lived state in immutable shared segments**, so a snapshot's size
   does not grow with the conversation (Flash).
@@ -222,7 +268,13 @@ GPU:
   (GGUF).
 - **Pool per-call buffers**, 3.6x on allocation and about 9x on release (GGUF).
 - **Sub-allocate small buffers from larger blocks.** Many small allocations next
-  to large weights lost the device, +39 % decode (GGUF).
+  to large weights lost the device, +39 % decode (GGUF). Place first fit across
+  all blocks and size the last block to what is left: bump allocation in fixed
+  blocks left each block's tail and most of the last block unused, about -6 %
+  of the decode's VRAM (Flash).
+- **Upload only what a split runs on the device.** When a table is split
+  between a GPU and the cores, rows past the largest split never run there:
+  about -3 % VRAM, speed and output unchanged (Flash lm_head).
 - **Stream weights through reused VRAM slots for prefill**, +63 %, because a
   chunk reads each weight once (GGUF).
 - **Overlap uploads on the transfer queue with host work**, about 4x on upload,
@@ -248,7 +300,9 @@ GPU:
 - **Add a streamed share for prefill**, resident, streamed and CPU rows with
   fractions from measured rates, +30 % (GGUF).
 - **Put a share of the attention on the GPU**, balanced by query rows, -27 %
-  (GGUF).
+  (GGUF); on a discrete card beside an NPU and iGPU, K / V copied to VRAM
+  once per block and the share from a frozen fit of both devices' rates,
+  -17 % of the transformer, which then binds on the NPU (H3).
 - **Keep decode MLPs on the cores plus VRAM rows when the NPU is slower there**,
   +26-39 % (NPU).
 - **Put the recurrence on the iGPU between NPU graphs**, with host buffers
@@ -260,7 +314,16 @@ GPU:
 - **Split far attention into key blocks merged by log-sum-exp**, which reaches
   long contexts and lets a second device share the blocks, +9 % (NPU).
 - **Add an iGPU share of the blocks**, spreading its chunks through each block,
-  -15-18 % (Image).
+  -15-18 % (Image); -9 % of the transformer where it then binds on the cores'
+  attention, which slows next to the iGPU (H3). Size the share so the iGPU
+  does not finish a block last: one chunk of 16 less took a further -7 %
+  (H3).
+- **Overlap NPU and iGPU jobs rather than alternating them** on shared DRAM:
+  an NPU job overlapped by iGPU jobs ran only 2 % longer (H3); check a
+  device's idle time first (ETW packets), a utilisation dip is usually a
+  wait on the other device, not bandwidth.
+- **Split independent tiles between the NPU and the iGPU**, whole tiles
+  through every layer on each device, -20 % on a ViT VAE decoder (H3).
 - **Run the vision tower's per-patch work on the NPU and its attention on the
   iGPU**, 3-4x over the cores (NPU).
 - **Use int8 prefix K / V only when they do not fit**, about -30 % memory with
@@ -270,6 +333,10 @@ GPU:
 
 ## Scheduling and pipelining
 
+- **Shrink the jobs at a pipeline barrier.** When every job of a stage must
+  finish before the next stage starts (all keys before any attention), the
+  other device idles during the first and last job: smaller jobs there cut
+  that idle time about 3x (H3).
 - **Reorder the outer loops around the costly shared pass.** Layer-major prefill
   with one expert pass per large piece gave +76 %, and larger pieces +11 % more
   (Flash).
@@ -308,6 +375,10 @@ positions costs about as much as decoding one.
 
 - **Use the model's own next-token head (MTP)** where it exists, about 2x on code
   with greedy output byte-identical (GGUF).
+- **Quantize the drafter harder than the model it drafts for.** Only the
+  acceptance rate depends on a draft's precision. Int4 drafter experts in place
+  of int8 halve their memory and the bytes a draft reads: about +1 % decode at
+  0.5 % lower acceptance, output unchanged (Flash MTP).
 - **Use a block drafter** that drafts from the target's features, +25 % over MTP
   on code (GGUF).
 - **Draft from context without a model** by copying what followed an earlier
@@ -380,6 +451,8 @@ Device placement:
 - **Whole GPU layers.** Correct, but not competitive with the row split.
 - **LRU weight cache or streaming for decode.** A dense model scans cyclically,
   and the bus is slower than DRAM.
+- **The whole lm_head on the GPU** (no host share), -2.3 % decode: the cores'
+  share of the rows runs beside the GPU's (Flash).
 - **Hot experts in VRAM.** Too little VRAM is left to cover enough reads, for at
   most about 5 % of decode.
 - **Large pages for shared expert buffers.** A real gain on the expert pass, but
@@ -420,6 +493,17 @@ Accuracy shortcuts:
 - **Skipping far blocks by softmax mass.** Attention is too diffuse at block
   granularity.
 - **Int4 transformer weights.** No faster on the NPU, with 3-4x the error (Image).
+- **Int4 MLP weights in a dense text encoder.** Only short prompts (64-row
+  jobs, bound by reading the weights) got faster, -17 %; long ones not at
+  all, and the int8-only iGPU share is lost. The denoiser's velocity error
+  doubled and the free-running image lost about 5 dB (H3). Dense matrices
+  stay int8 as in a MoE whose experts alone are int4 (Flash).
 - **Block cache across diffusion steps.** Visible changes on some prompts (Image).
 - **Block-sparse attention for many references.** About 1.4x at best (Image).
 - **Resampled step schedules.** They redraw the image and look harsh (Image).
+- **Int8 attention for a model with massive activations.** It doubled one
+  step's velocity error, for 5 % of a job whose attention hides behind the
+  NPU (Image, H3).
+- **Per-row activations everywhere.** Per-row inputs of the out and gate /
+  up projections raised the velocity error 1.8x over calibrated ranges,
+  and per-row QKV gained nothing (Image, H3).

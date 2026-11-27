@@ -213,7 +213,12 @@ pub fn factor(h: Vec<f32>, k: usize) -> Result<Factor, String> {
 
 /// GPTQ of `w` `[n][k]` (consumed) with the fixed row scales `sc`: the codes
 /// `[n][k]` in `[-8, 7]`.
-pub fn gptq(mut w: Vec<f32>, n: usize, f: &Factor, sc: &[f32]) -> Vec<i8> {
+pub fn gptq(w: Vec<f32>, n: usize, f: &Factor, sc: &[f32]) -> Vec<i8> {
+	gptq_range(w, n, f, sc, -8.0, 7.0)
+}
+
+/// [`gptq`] with codes in `[lo, hi]` (int8: `[-127, 127]`).
+pub fn gptq_range(mut w: Vec<f32>, n: usize, f: &Factor, sc: &[f32], lo: f32, hi: f32) -> Vec<i8> {
 	let k = f.k;
 	assert_eq!(w.len(), n * k);
 	assert_eq!(sc.len(), n);
@@ -263,7 +268,7 @@ pub fn gptq(mut w: Vec<f32>, n: usize, f: &Factor, sc: &[f32]) -> Vec<i8> {
 				};
 				let s = sc[r];
 				for i in 0..bs {
-					let c = (wr[i] / s).round_ties_even().clamp(-8.0, 7.0);
+					let c = (wr[i] / s).round_ties_even().clamp(lo, hi);
 					qr[i] = c as i8;
 					let err = (wr[i] - c * s) / u1[i * bs + i];
 					er[i] = err;
@@ -319,6 +324,101 @@ pub fn gptq(mut w: Vec<f32>, n: usize, f: &Factor, sc: &[f32]) -> Vec<i8> {
 	out
 }
 
+/// Rows per panel of a [`Gram`].
+pub const GP: usize = 256;
+
+/// A running `X^T X` of `k`-wide rows, stored as its lower triangle by
+/// panels of [`GP`] rows: panel `p` holds rows `[p GP, (p + 1) GP)` and
+/// columns `[0, (p + 1) GP)` row-major, so each added chunk is one GEMM per
+/// panel and the matrix takes about half of `k^2` floats.
+pub struct Gram {
+	pub k: usize,
+	pub h: Vec<f32>,
+	/// Rows added.
+	pub n: usize,
+}
+
+impl Gram {
+	/// Offset of panel `p`.
+	fn off(p: usize) -> usize {
+		GP * GP * p * (p + 1) / 2
+	}
+
+	pub fn new(k: usize) -> Gram {
+		assert_eq!(k % GP, 0, "Gram width {k} is not a multiple of {GP}");
+		Gram {
+			k,
+			h: vec![0f32; Self::off(k / GP)],
+			n: 0,
+		}
+	}
+
+	/// Add the rows `x` `[s][k]`.
+	pub fn add(&mut self, x: &[f32]) {
+		let k = self.k;
+		let s = x.len() / k;
+		if s == 0 {
+			return;
+		}
+		let xt = la::transpose(x, s, k);
+		for p in 0..k / GP {
+			let w = (p + 1) * GP;
+			// SAFETY: xt is [k][s]; panel p is [GP][w] at its offset
+			unsafe {
+				la::gemm_nt_raw(
+					xt.as_ptr().add(p * GP * s),
+					s,
+					GP,
+					xt.as_ptr(),
+					s,
+					w,
+					s,
+					self.h.as_mut_ptr().add(Self::off(p)),
+					w,
+					Acc::Add,
+				)
+			};
+		}
+		self.n += s;
+	}
+
+	/// The full symmetric `[k][k]` matrix.
+	pub fn full(&self) -> Vec<f32> {
+		let k = self.k;
+		let mut f = vec![0f32; k * k];
+		for i in 0..k {
+			let (p, r) = (i / GP, i % GP);
+			let w = (p + 1) * GP;
+			let row = &self.h[Self::off(p) + r * w..][..=i];
+			f[i * k..i * k + i + 1].copy_from_slice(row);
+			for (j, &v) in row.iter().enumerate() {
+				f[j * k + i] = v;
+			}
+		}
+		f
+	}
+
+	/// The stored floats, little endian.
+	pub fn to_bytes(&self) -> Vec<u8> {
+		self.h.iter().flat_map(|v| v.to_le_bytes()).collect()
+	}
+
+	pub fn from_bytes(k: usize, b: &[u8]) -> Result<Gram, String> {
+		let mut g = Gram::new(k);
+		if b.len() != g.h.len() * 4 {
+			return Err(format!(
+				"Gram of width {k}: {} bytes, expected {}",
+				b.len(),
+				g.h.len() * 4
+			));
+		}
+		for (o, c) in g.h.iter_mut().zip(b.chunks_exact(4)) {
+			*o = f32::from_le_bytes(c.try_into().unwrap());
+		}
+		Ok(g)
+	}
+}
+
 /// Round to nearest with the same scales (no Hessian).
 pub fn rtn(w: &[f32], n: usize, k: usize, sc: &[f32]) -> Vec<i8> {
 	let mut q = vec![0i8; n * k];
@@ -368,6 +468,24 @@ mod tests {
 				.map(|(a, b)| a * b)
 				.sum();
 			assert!((a - b).abs() < 1e-3, "{a} {b}");
+		}
+	}
+
+	#[test]
+	fn gram_matches_xtx() {
+		let (s, k) = (37usize, 2 * GP);
+		let x: Vec<f32> = (0..s * k)
+			.map(|i| ((i * 29 % 97) as f32 - 48.0) / 48.0)
+			.collect();
+		let mut g = Gram::new(k);
+		g.add(&x[..20 * k]);
+		g.add(&x[20 * k..]);
+		assert_eq!(g.n, s);
+		let xt = la::transpose(&x, s, k);
+		let h = la::linear(&xt, k, s, &xt, k);
+		let f = Gram::from_bytes(k, &g.to_bytes()).unwrap().full();
+		for (a, b) in f.iter().zip(&h) {
+			assert!((a - b).abs() < 1e-3 * b.abs().max(1.0), "{a} {b}");
 		}
 	}
 

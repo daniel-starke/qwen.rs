@@ -1,7 +1,7 @@
 # qwen.rs
 
-A from-scratch Rust inference server for **Qwen3.8-27B**, **Qwen3.8-Flash-Next**
-and **Qwen-Image-2.1-Turbo**. It serves an **Anthropic Messages API** and an
+A from-scratch Rust inference server for **Qwen3.8-27B**, **Qwen3.8-Flash-Next**,
+**Qwen-Image-2.1-Turbo** and **MiniMax-H3-Image**. It serves an **Anthropic Messages API** and an
 **OpenAI Chat Completions / llama-server**-compatible HTTP endpoint, so coding
 agents such as Zed and Claude Code can use a local model, and it generates
 images through **MCP** and the **OpenAI Images API**.
@@ -37,9 +37,10 @@ tested only on Windows 11.
   taken from each tool's JSON schema.
 - **Thinking** per request, with an effort level and a token budget.
 - **Images in the conversation** (PNG, JPEG, BMP, Netpbm) on every setup.
-- **Image generation** with Qwen-Image-2.1-Turbo, covering text to image and edits with
-  up to 10 reference images, as MCP tools for coding agents and as the OpenAI
-  Images API.
+- **Image generation** with Qwen-Image-2.1-Turbo (edits with up to 10
+  reference images) or MiniMax-H3-Image (4 MP by default, edits with up to 16
+  reference images), covering text to image and edits, as MCP tools for
+  coding agents and as the OpenAI Images API.
 - **Prefix cache.** A follow-up turn, an edited message or a new conversation
   with the same tools prefills only what is new, also across server restarts
   with `--prompt-cache-dir`.
@@ -240,7 +241,7 @@ three `.npu` files.
 | `head` | `lm_head.f16` | the lm_head as f16 (the GPU decode path quantizes it to int8 at load) |
 | `graphs`, `compile` | `graphs/flash/*` | the per-layer prefill and one-position graphs and the expert jobs |
 | `vis` | `sets/vis` | the vision tower (the 27B's, merger output 2560) |
-| `mtp` | `mtp/` | the multi-token-prediction layer, int8 per row |
+| `mtp` | `mtp/` | the multi-token-prediction layer, int8 per row (routed experts int4) |
 | `sets` | `model*.npu` | the three `.npu` files |
 
 ### Qwen-Image
@@ -251,6 +252,20 @@ three `.npu` files.
 
 The CPU backend reads the checkpoint directory as is. `--npu-build` on it
 writes the NPU set (`image.npu`, ~6 min with the NPU compiler).
+
+### MiniMax-H3-Image
+
+| File | Download |
+|---|---|
+| `MiniMaxAI/MiniMax-H3-Image` (diffusers layout, ~135 GB) | [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image), revision `8ced60068623` |
+
+Only the diffusers layout is read (`transformer_diffusers/`,
+`vae_diffusers/`, `text_encoder/`, `tokenizer/`, `processor/` and the JSON
+files); the native layout (`transformer/`, `vae/`,
+`pdd_fused_heads.safetensors`) can be left out. The CPU backend converts the
+weights to Q6_K at load; `--image-cache DIR` keeps the converted weights
+(~34 GB) so later loads skip the conversion. `--npu-build` on it writes the
+NPU set (`image.npu`, ~2 h with the NPU compiler, ~45 GB of weights).
 
 ## Running
 
@@ -461,6 +476,27 @@ cli path/to/npu/model.npu --serve 8080 --image-model path/to/qimage/image.npu --
   serves the image routes alone.
 
 See [docs/image.md](docs/image.md) for details.
+
+### Image generation (MiniMax-H3-Image)
+
+`MiniMaxAI/MiniMax-H3-Image` does text to image and edits with up to 16
+reference images (`<Picture N>` in the prompt), 6 fixed steps, 4 MP by
+default and up to 16 MP. The same commands, MCP tools and routes as
+Qwen-Image apply; the path picks the model, one image model per server. From
+the checkpoint directory it runs on the cores (Q6_K, a 4 MP image ~10 min).
+The `image.npu` set runs the text encoder, the transformer and the VAE
+decoder on the NPU, with shares on the iGPU and on a discrete Vulkan card
+(a 4 MP image ~3 min). Resident memory is ~35 GB.
+
+```bash
+# the NPU set (~2 h; needs the BF16 checkpoint, the NPU compiler and the NPU)
+cli path/to/MiniMax-H3-Image --npu-build path/to/h3 --npu-compiler path/to/npu-compiler/bin --image-cache path/to/h3-cache
+
+cli path/to/h3/image.npu --txt2img "a lighthouse at dusk, oil painting" -o out.png
+cli path/to/npu/model.npu --serve 8080 --image-model path/to/h3/image.npu --image-out-dir path/to/images
+```
+
+See [docs/h3image.md](docs/h3image.md) for details.
 
 ### The NPU through OpenVINO (experimental)
 
@@ -681,7 +717,10 @@ cargo build --release -p cli --features vulkan --config 'profile."*".incremental
 The crates the build pulls in are `ash` 0.38 (only with the `vulkan` feature),
 `fancy-regex` 0.13 (the tokenizer's pre-tokenizer) and `image` 0.25 (PNG /
 JPEG / BMP / PNM decoding only), plus 26 transitive crates pinned in
-`Cargo.lock`. There is no build script and no C code in the build.
+`Cargo.lock`. No C code is in the build; the build scripts only write the
+linker map and deflate embedded data (shaders, tables, texts) with
+`miniz_oxide`, which `image` links anyway. Binaries carry no build-machine
+paths (cargo `trim-paths`, nightly).
 
 Needed only for specific tasks:
 
@@ -692,7 +731,7 @@ Needed only for specific tasks:
 | Regenerating test fixtures (`crates/*/tests/*.py`) | Python 3 with `jinja2` (chat template), `Pillow` and `numpy` (image / vision references) |
 | Correctness reference | a llama.cpp build (`llama-cli`, or LM Studio's `llama-server` for vision) |
 | OpenVINO experiments (`crates/ov/scripts`) | Python 3 with `openvino` (2026.4.0 wheel), `numpy`, `openvino_genai` (`genai_ref.py`) |
-| Image generation reference dumps (`crates/imagegen/scripts/refdump.py`) | Python 3 with `diffusers` 0.42 and `transformers` 5 (ComfyUI's embedded Python has both) |
+| Image generation reference dumps (`crates/imagegen/scripts/qimage_refdump.py`) | Python 3 with `diffusers` 0.42 and `transformers` 5 (ComfyUI's embedded Python has both) |
 | NPU experiments (`crates/npu/scripts`, which rewrite an OpenVINO export's graphs and which nothing else needs) | Python 3 with `openvino` and `numpy`, an OpenVINO export, a POSIX `sh` and PowerShell |
 | Building or writing NPU SHAVE kernels (`crates/npu/shave/*.sk`) | nothing extra, because our own kernel compiler, assembler and linker are included (`cargo build --release -p npu --example shave`, with the language in `crates/npu/SHAVE-DSL.md`) |
 | Adding an instruction to the SHAVE kernel language | the NPU, because `crates/npu/scripts/shavedev.py` measures it on the device (`crates/npu/NPU.md` §2 "Provenance") |
@@ -704,6 +743,7 @@ Needed only for specific tasks:
 | [docs/architecture.md](docs/architecture.md) | How it works, covering crates, the model, the CPU + GPU row split, the NPU engine and its build, Qwen3.8-Flash-Next, speculative decoding |
 | [docs/server.md](docs/server.md) | The HTTP APIs, tool use and the model's call format, the prefix cache, clients |
 | [docs/image.md](docs/image.md) | Image generation, covering the model, the NPU and CPU backends, MCP and the Images API |
+| [docs/h3image.md](docs/h3image.md) | Image generation with MiniMax-H3-Image, covering the model, the NPU and CPU backends and their measurements |
 | [docs/vision.md](docs/vision.md) | Running images through the model, and the invariants of the vision path |
 | [docs/optimizations.md](docs/optimizations.md) | Optimization techniques that proved successful and those measured and rejected, with relative gains, to shorten work on a new model path |
 | [crates/cli/README.md](crates/cli/README.md) | Every command-line flag and environment variable |

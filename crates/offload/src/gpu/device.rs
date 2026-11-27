@@ -260,37 +260,22 @@ impl GpuDevice {
 		let xfer_queue = xfamily.map(|f| unsafe { device.get_device_queue(f, 0) });
 
 		// SPIR-V shader modules.
-		let sm_q4k = create_sm(&device, &load_spv(include_bytes!("../shaders/q4k.spv")))?;
-		let sm_q6k = create_sm(&device, &load_spv(include_bytes!("../shaders/q6k.spv")))?;
-		let sm_q4k_f32 = create_sm(&device, &load_spv(include_bytes!("../shaders/q4k_f32.spv")))?;
-		let sm_q6k_f32 = create_sm(&device, &load_spv(include_bytes!("../shaders/q6k_f32.spv")))?;
-		let sm_q4k_f32_seq = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/q4k_f32_seq.spv")),
-		)?;
-		let sm_q6k_f32_seq = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/q6k_f32_seq.spv")),
-		)?;
-		let sm_q8_0 = create_sm(&device, &load_spv(include_bytes!("../shaders/q8_0.spv")))?;
-		let sm_f16 = create_sm(&device, &load_spv(include_bytes!("../shaders/f16.spv")))?;
-		let sm_f32 = create_sm(&device, &load_spv(include_bytes!("../shaders/f32.spv")))?;
-		let sm_gemm_q4k = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/gemm_q4k.spv")),
-		)?;
-		let sm_gemm_q6k = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/gemm_q6k.spv")),
-		)?;
+		let sm_q4k = create_sm(&device, &load_spv(quant::packed!("q4k.spv")))?;
+		let sm_q6k = create_sm(&device, &load_spv(quant::packed!("q6k.spv")))?;
+		let sm_q4k_f32 = create_sm(&device, &load_spv(quant::packed!("q4k_f32.spv")))?;
+		let sm_q6k_f32 = create_sm(&device, &load_spv(quant::packed!("q6k_f32.spv")))?;
+		let sm_q4k_f32_seq = create_sm(&device, &load_spv(quant::packed!("q4k_f32_seq.spv")))?;
+		let sm_q6k_f32_seq = create_sm(&device, &load_spv(quant::packed!("q6k_f32_seq.spv")))?;
+		let sm_q8_0 = create_sm(&device, &load_spv(quant::packed!("q8_0.spv")))?;
+		let sm_f16 = create_sm(&device, &load_spv(quant::packed!("f16.spv")))?;
+		let sm_f32 = create_sm(&device, &load_spv(quant::packed!("f32.spv")))?;
+		let sm_gemm_q4k = create_sm(&device, &load_spv(quant::packed!("gemm_q4k.spv")))?;
+		let sm_gemm_q6k = create_sm(&device, &load_spv(quant::packed!("gemm_q6k.spv")))?;
 		// DP4A Q4_K is optional: if the precompiled SPIR-V fails to load
 		// (e.g. a driver that rejects `OpSDotKHR`), disable it and keep the
 		// validated scalar Q4_K path. This must not break the whole device.
 		let sm_q4k_dp4a = if use_dp4a {
-			match create_sm(
-				&device,
-				&load_spv(include_bytes!("../shaders/dp4a_q4k.spv")),
-			) {
+			match create_sm(&device, &load_spv(quant::packed!("dp4a_q4k.spv"))) {
 				Ok(sm) => Some(sm),
 				Err(e) => {
 					eprintln!("offload: dp4a Q4_K shader load failed ({e}); using scalar Q4_K");
@@ -393,10 +378,8 @@ impl GpuDevice {
 				}
 			}
 		};
-		let pipeline_gemm_q4k_dp4a =
-			dp4a_gemm(include_bytes!("../shaders/gemm_q4k_dp4a.spv"), "Q4_K");
-		let pipeline_gemm_q6k_dp4a =
-			dp4a_gemm(include_bytes!("../shaders/gemm_q6k_dp4a.spv"), "Q6_K");
+		let pipeline_gemm_q4k_dp4a = dp4a_gemm(quant::packed!("gemm_q4k_dp4a.spv"), "Q4_K");
+		let pipeline_gemm_q6k_dp4a = dp4a_gemm(quant::packed!("gemm_q6k_dp4a.spv"), "Q6_K");
 		let pipeline_q4k_dp4a = if use_dp4a {
 			if let Some(m) = sm_q4k_dp4a {
 				match compute_pipeline_sg32(&device, pipeline_layout, m, &main) {
@@ -468,38 +451,14 @@ impl GpuDevice {
 				)
 				.map_err(|e| format!("aux pipeline layout: {e}"))?
 		};
-		let sm_rms_sum = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_rmsnorm_sum.spv")),
-		)?;
-		let sm_rms_apply = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_rmsnorm_apply.spv")),
-		)?;
-		let sm_prep_q = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_prep_q.spv")),
-		)?;
-		let sm_prep_k = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_prep_k.spv")),
-		)?;
-		let sm_attn = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_attn.spv")),
-		)?;
-		let sm_silu = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_silu_mul.spv")),
-		)?;
-		let sm_residual = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_residual.spv")),
-		)?;
-		let sm_q8 = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_quantize_q8k.spv")),
-		)?;
+		let sm_rms_sum = create_sm(&device, &load_spv(quant::packed!("aux_rmsnorm_sum.spv")))?;
+		let sm_rms_apply = create_sm(&device, &load_spv(quant::packed!("aux_rmsnorm_apply.spv")))?;
+		let sm_prep_q = create_sm(&device, &load_spv(quant::packed!("aux_prep_q.spv")))?;
+		let sm_prep_k = create_sm(&device, &load_spv(quant::packed!("aux_prep_k.spv")))?;
+		let sm_attn = create_sm(&device, &load_spv(quant::packed!("aux_attn.spv")))?;
+		let sm_silu = create_sm(&device, &load_spv(quant::packed!("aux_silu_mul.spv")))?;
+		let sm_residual = create_sm(&device, &load_spv(quant::packed!("aux_residual.spv")))?;
+		let sm_q8 = create_sm(&device, &load_spv(quant::packed!("aux_quantize_q8k.spv")))?;
 		let pl_rms_sum = compute_pipeline(&device, aux_pipeline_layout, sm_rms_sum, &main)?;
 		let pl_rms_apply = compute_pipeline(&device, aux_pipeline_layout, sm_rms_apply, &main)?;
 		let pl_prep_q = compute_pipeline(&device, aux_pipeline_layout, sm_prep_q, &main)?;
@@ -508,35 +467,17 @@ impl GpuDevice {
 		let pl_silu = compute_pipeline(&device, aux_pipeline_layout, sm_silu, &main)?;
 		let pl_residual = compute_pipeline(&device, aux_pipeline_layout, sm_residual, &main)?;
 		let pl_q8 = compute_pipeline(&device, aux_pipeline_layout, sm_q8, &main)?;
-		let sm_conv1d = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_conv1d.spv")),
-		)?;
-		let sm_l2norm = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_l2norm.spv")),
-		)?;
-		let sm_ssm_beta = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_ssm_beta.spv")),
-		)?;
-		let sm_ssm_gate = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_ssm_gate.spv")),
-		)?;
-		let sm_delta_net = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_delta_net.spv")),
-		)?;
+		let sm_conv1d = create_sm(&device, &load_spv(quant::packed!("aux_conv1d.spv")))?;
+		let sm_l2norm = create_sm(&device, &load_spv(quant::packed!("aux_l2norm.spv")))?;
+		let sm_ssm_beta = create_sm(&device, &load_spv(quant::packed!("aux_ssm_beta.spv")))?;
+		let sm_ssm_gate = create_sm(&device, &load_spv(quant::packed!("aux_ssm_gate.spv")))?;
+		let sm_delta_net = create_sm(&device, &load_spv(quant::packed!("aux_delta_net.spv")))?;
 		let pl_conv1d = compute_pipeline(&device, aux_pipeline_layout, sm_conv1d, &main)?;
 		let pl_l2norm = compute_pipeline(&device, aux_pipeline_layout, sm_l2norm, &main)?;
 		let pl_ssm_beta = compute_pipeline(&device, aux_pipeline_layout, sm_ssm_beta, &main)?;
 		let pl_ssm_gate = compute_pipeline(&device, aux_pipeline_layout, sm_ssm_gate, &main)?;
 		let pl_delta_net = compute_pipeline(&device, aux_pipeline_layout, sm_delta_net, &main)?;
-		let sm_ssm_rms_o = create_sm(
-			&device,
-			&load_spv(include_bytes!("../shaders/aux_ssm_rms_o.spv")),
-		)?;
+		let sm_ssm_rms_o = create_sm(&device, &load_spv(quant::packed!("aux_ssm_rms_o.spv")))?;
 		let pl_ssm_rms_o = compute_pipeline(&device, aux_pipeline_layout, sm_ssm_rms_o, &main)?;
 
 		// Persistent descriptor pool for per-weight (decode path) sets.

@@ -15,8 +15,9 @@ Kernels that use subgroup operations (`subgroupAdd`, `subgroupBroadcast`)
 also need `--target-env=vulkan1.1`, as the table below marks. The device
 is created at API 1.1 for this reason.
 
-There is **no build script**. A `.spv` is rebuilt only when the command
-above runs, so always recompile and commit the `.spv` together with its
+No build script compiles shaders (`build.rs` only deflates the `.spv`
+files, embedded with `quant::packed!`). A `.spv` is rebuilt only when the
+command above runs, so always recompile and commit the `.spv` together with its
 `.glsl` edit.
 
 ## Kernels
@@ -39,6 +40,10 @@ need `--target-env=vulkan1.1`.
 | `exp_gemm`, `exp_act`, `exp_xq` | Flash-Next prefill routed experts on the iGPU | yes | `expbench` |
 | `idx_score_npu` | Flash-Next prefill block indexer on the iGPU | yes | `indexer` test |
 | `dit_gemm_npu`, `dit_row_npu`, `dit_act_npu`, `dit_qkv_npu` | Qwen-Image transformer blocks on the iGPU | yes, except `dit_qkv` | `dit_mid` test |
+| `h3_row_npu`, `h3_act_npu`, `h3_qkv_npu` (+ `dit_gemm_npu`) | MiniMax-H3-Image transformer blocks on the iGPU | yes, except `h3_qkv` | `h3_mid` test |
+| `h3te_act_npu` (+ `h3_row_npu`, `h3_qkv_npu` at the text encoder's widths) | MiniMax-H3-Image text encoder layers on the iGPU | yes, except `h3te_qkv` | `h3_mid` test |
+| `h3v_gemm`, `h3v_attn`, `h3v_qk`, `h3v_norm`, `h3v_elem` | MiniMax-H3-Image VAE decoder tiles on the iGPU | yes | `h3_vae` test |
+| `h3_attn` | MiniMax-H3-Image transformer attention on the GTX 1060 | yes | `h3_attention_matches_reference`, `h3_attention_bench` |
 | `vis_rope_npu`, `vis_qk_npu`, `vis_sm_npu`, `vis_pv_npu` | Attention of the NPU engine's vision tower on the iGPU | | `visbench` |
 | `aux_rmsnorm_sum` | Deliberately single-threaded (see the comment in the file) | | |
 | `alu_probe` | ALU ceiling measurement (`gpubench --gate`), no matmul | | |
@@ -106,6 +111,31 @@ indexer -- --include-ignored --nocapture`.
   `dit_qkv_npu` writes q / k / v. The `dit_mid` test
   (`QWEN_TEST_ADAPTER=intel`) checks a job against a host model and times
   it.
+- **`h3_row_npu`, `h3_act_npu`, `h3_qkv_npu`** run MiniMax-H3-Image's
+  `h3/mid` job (`gpu/h3blk.rs`, `offload::H3Blk`) with `dit_gemm_npu` for
+  the matmuls: the stored residual times `xr` plus the out projection,
+  RMSNorm times the modulation entry plus its shift, the up half's 1 / 256
+  before SwiGLU. `h3_row_npu` is built three times: `-DMODE=0 -DW=7168u`
+  gives `h3_row0_npu.spv` (the attention width), `-DMODE=1` / `-DMODE=2`
+  give `h3_row1_npu.spv` / `h3_row2_npu.spv`. The text encoder's layers
+  (`H3Blk` at its widths: d 5120, attention 8192, K / V 1024, MLP 25600)
+  use `h3_row_npu` with `-DMODE=0 -DW=8192u` / `-DMODE=1 -DW=5120u` /
+  `-DMODE=2 -DW=5120u` (`h3te_row0_npu.spv` to `h3te_row2_npu.spv`),
+  `h3_qkv_npu` with `-DA=8192u -DKV=1024u` (`h3te_qkv_npu.spv`) and
+  `h3te_act_npu` (its hidden row is past the 64 KB of shared memory, so it
+  is rotated in two halves written back over the gate half of `y`). The
+  `h3_mid` test (`QWEN_TEST_ADAPTER=intel`) checks a job of both shapes
+  against a host model and times it.
+- **`h3v_gemm`, `h3v_attn`, `h3v_qk`, `h3v_norm`, `h3v_elem`** run whole
+  tiles of MiniMax-H3-Image's VAE decoder (`gpu/h3vae.rs`,
+  `offload::H3Vae`) in f32 on the NPU's f16 weights: a 64 x 64 tiled GEMM
+  with bias and residual add, attention within a tile (one query per
+  thread, keys in chunks of 32), q / k RMSNorm and RoPE, the norms
+  (`-DMODE=0` RMSNorm, `-DMODE=1` the head's LayerNorm: `h3v_norm0.spv`,
+  `h3v_norm1.spv`) and the elementwise steps (`-DMODE=0` f16 in, `1`
+  SwiGLU, `2` f16 out: `h3v_elem0.spv` to `h3v_elem2.spv`). The `h3_vae`
+  test checks two tiles through one layer and the head against a host
+  model.
 - **`vis_rope_npu`, `vis_qk_npu`, `vis_sm_npu`, `vis_pv_npu`** are the
   attention of the NPU engine's vision tower (`gpu/visattn.rs`,
   `offload::VisAttn`). They compute 2-D RoPE into f32 buffers per head, the scores of a

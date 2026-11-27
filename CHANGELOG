@@ -1,8 +1,19 @@
 version numbering schema:
 M.N.P
-| | +-- patch: increased if only bug fixed were incorporated
-| +---- minor: increased if syntax/semantic breaking changes were applied
+| | +-- patch: increased if only bug fixes were incorporated
+| +---- minor: increased if new features were added
 +------ major: increased if elementary changes (from user's point of view) were made
+
+1.1.0 (2026-11-27)
+ - added: image generation and editing with MiniMax-H3-Image (--txt2img, MCP and the OpenAI Images API, picked by the --image-model path): 4 MP images by default, up to 16 MP, up to 16 reference images
+ - added: MiniMax-H3-Image on the NPU: `cli H3_DIR --npu-build OUT` builds an image.npu (int8 GPTQ weights) that runs the text encoder, the transformer and the VAE decoder on the NPU, with shares on the iGPU and a discrete Vulkan card (GTX 1060): a 4 MP image in about 3 minutes instead of 10 on the cores
+ - added: --image-cache DIR (or QWEN_IMAGE_CACHE_DIR) keeps MiniMax-H3-Image's converted weights on disk, so later loads skip the conversion
+ - added: every build writes a linker map beside cli.exe (cli.map), and scripts/mapsize.py breaks it down by section, crate and symbol for binary size analysis
+ - added: QWEN_POOL_STATS=1 prints the allocator's cached memory on Flash-Next --generate
+ - changed: cli.exe is about 17 % smaller: shaders, tables and built-in texts are stored compressed, and only the Unicode tables the tokenizer uses are linked
+ - changed: binaries no longer contain paths of the build machine
+ - changed: Flash-Next needs about 440 MiB less VRAM on the GTX 1060 (no unused lm_head rows, tighter packing of the dense weights)
+ - changed: Flash-Next needs about 5 GiB less memory: the lm_head is converted while it is read, the vision tower loads with the first image, the host keeps only its share of the lm_head when the GPU holds it, and the MTP head's experts are int4 (run --npu-steps mtp again to add them to an existing build; without them the int8 files are used)
 
 1.0.1 (2026-11-21)
  - fixed: images read as blank or noise by the vision tower of the NPU engines

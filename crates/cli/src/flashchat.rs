@@ -645,6 +645,14 @@ pub fn generate(
 		quant::cputime::describe(prefill_s, prefill_use, ids.len()),
 		quant::cputime::describe(decode_s, decode_use, produced)
 	);
+	if quant::parallel::stats_on() {
+		let (h, pk, n) = quant::alloc::held();
+		eprintln!(
+			"  [alloc] recycling cache holds {} MB in {n} blocks (at most {} MB)",
+			h >> 20,
+			pk >> 20
+		);
+	}
 	if pstats.3 > 0 {
 		eprintln!(
 			"  [pool] decode work {:.2} s, spin {:.2} s, join {:.2} s, {} dispatches, {} parks",

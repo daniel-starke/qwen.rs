@@ -12,7 +12,10 @@ publish.workspace = true
 
 [dependencies]
 gguf = { path = "../gguf" }
-fancy-regex = "0.13"
+fancy-regex = { version = "0.13", default-features = false, features = ["std", "perf"] }
+# Only the Unicode tables the pre-tokenizer pattern uses (\p{L}, \p{M},
+# \p{N}, \s): general categories and Perl classes, not all of them.
+regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode-gencat", "unicode-perl"] }
 
 [lints]
 workspace = true

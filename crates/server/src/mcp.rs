@@ -268,7 +268,7 @@ pub(crate) fn handle(
 				"{{\"protocolVersion\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"qwen.rs\",\"title\":\"qwen.rs image generation\",\"version\":{}}},\"instructions\":{}}}",
 				jstr(ver),
 				jstr(env!("CARGO_PKG_VERSION")),
-				jstr(INSTRUCTIONS)
+				jstr(instructions())
 			);
 			reply(w, 200, "OK", Some(&s), &rpc_result(&id, &result))
 		}
@@ -296,12 +296,35 @@ pub(crate) fn handle(
 
 const INSTRUCTIONS: &str = "Local image generation with Qwen-Image-2.1 on this machine. generate_image makes an image from a detailed prompt (describe subject, composition, style, lighting, any text to render in quotes); edit_image changes or combines existing images (1-10, absolute paths or data: URLs) as the prompt says. Give output_path (inside the project) to save the PNG there. An image takes a few minutes on the CPU; progress is reported per step.";
 
+const INSTRUCTIONS_H3: &str = "Local image generation with MiniMax-H3-Image on this machine. generate_image makes an image from a long, precise English description (subject, composition, camera, style, lighting, colors, any text to render in quotes); the model follows detailed descriptions, so write one rather than a short phrase. edit_image changes or combines 1-16 existing images (absolute paths or data: URLs); the prompt refers to them as <Picture 1>, <Picture 2>, ... in the order given. Images are generated at 4 megapixels or more (2048x2048 by default; smaller sizes are generated at 4 MP and scaled down) and look best toward 16 MP. Give output_path (inside the project) to save the PNG there. This is a large model: a 4 MP image takes about 12 minutes on the CPU (16 MP several times that), and every reference image makes each of the 6 steps longer (a 1 MP reference adds about a quarter to a 4 MP image, a 4 MP reference doubles it); progress is reported per step.";
+
+fn instructions() -> &'static str {
+	match images::info().steps {
+		true => INSTRUCTIONS,
+		false => INSTRUCTIONS_H3,
+	}
+}
+
 fn tools_json() -> String {
+	if !images::info().steps {
+		return tools_json_h3();
+	}
 	let common = r#""prompt":{"type":"string","description":"What to draw: subject, composition, style, lighting, colors; text to render in quotes."},"aspect":{"type":"string","enum":["1:1","4:3","3:4","3:2","2:3","16:9","9:16"],"description":"Aspect ratio at about 1 megapixel (default 1:1, or the last input image's for an edit)."},"width":{"type":"integer","description":"Width in pixels (multiple of 32, 256-2048); with height, overrides aspect."},"height":{"type":"integer","description":"Height in pixels (multiple of 32, 256-2048)."},"seed":{"type":"integer","description":"Seed for a reproducible image (random when absent; returned)."},"steps":{"type":"integer","minimum":1,"maximum":50,"description":"Denoising steps (default 9: the model's 8 distilled steps plus one refinement step for fine texture). 8 = the model's schedule as shipped (~11 % faster, softer detail). Other counts stretch the schedule: slower, change the composition, and look over-sharpened from about 12 on; rarely useful."},"transparent":{"type":"boolean","description":"Keep the alpha channel (RGBA PNG) for a transparent background; ask for it in the prompt too."},"output_path":{"type":"string","description":OUTPUT_PATH_DOC},"return":{"type":"string","enum":["path","inline","both"],"description":"path: only save the file; inline: only return the image; both (default when output_path is given, else inline)."}"#;
 	let dirs = images::cfg().map_or(&[][..], |c| &c.out_dirs[..]);
 	let common = common.replace("OUTPUT_PATH_DOC", &jstr(&output_path_doc(dirs)));
 	format!(
 		r#"[{{"name":"generate_image","title":"Generate image","description":"Generate an image from a text prompt with Qwen-Image-2.1 (local). Returns the image inline (a preview of at most 1024 px) and/or saves the PNG to output_path.","inputSchema":{{"type":"object","properties":{{{common}}},"required":["prompt"]}}}},{{"name":"edit_image","title":"Edit image","description":"Edit or combine images with Qwen-Image-2.1 (local) as the prompt instructs (e.g. 'replace the sky with a sunset', 'put the cat from image 1 on the sofa of image 2'). Returns the result inline and/or saves it to output_path.","inputSchema":{{"type":"object","properties":{{"images":{{"type":"array","items":{{"type":"string"}},"minItems":1,"maxItems":10,"description":"Input images: absolute file paths or data: URLs."}},{common}}},"required":["prompt","images"]}}}}]"#
+	)
+}
+
+/// The tools on MiniMax-H3-Image: 4 MP and up, up to 16 references, a fixed
+/// schedule (no steps), no alpha.
+fn tools_json_h3() -> String {
+	let common = r#""prompt":{"type":"string","description":"A long, precise English description of the image: subject, composition, camera and lens, style, lighting, colors; text to render in quotes. For an edit, refer to the inputs as <Picture 1>, <Picture 2>, ..."},"aspect":{"type":"string","enum":["1:1","4:3","3:4","3:2","2:3","16:9","9:16","21:9","9:21"],"description":"Aspect ratio at 4 megapixels (default 1:1, or the last input image's for an edit)."},"width":{"type":"integer","description":"Width in pixels (multiple of 32, 256-8192, at most 16 megapixels with height); with height, overrides aspect. Below 4 MP the image is generated at 4 MP and scaled down."},"height":{"type":"integer","description":"Height in pixels (multiple of 32, 256-8192)."},"seed":{"type":"integer","description":"Seed for a reproducible image (random when absent; returned)."},"output_path":{"type":"string","description":OUTPUT_PATH_DOC},"return":{"type":"string","enum":["path","inline","both"],"description":"path: only save the file; inline: only return the image; both (default when output_path is given, else inline)."}"#;
+	let dirs = images::cfg().map_or(&[][..], |c| &c.out_dirs[..]);
+	let common = common.replace("OUTPUT_PATH_DOC", &jstr(&output_path_doc(dirs)));
+	format!(
+		r#"[{{"name":"generate_image","title":"Generate image","description":"Generate an image from a detailed text description with MiniMax-H3-Image (local, 4-16 megapixels, about 12 minutes for 4 MP). Returns the image inline (a preview of at most 1024 px) and/or saves the PNG to output_path.","inputSchema":{{"type":"object","properties":{{{common}}},"required":["prompt"]}}}},{{"name":"edit_image","title":"Edit image","description":"Edit or combine 1-16 images with MiniMax-H3-Image (local) as the prompt instructs, referring to them as <Picture 1>, <Picture 2>, ... (e.g. 'Put the cat from <Picture 1> on the sofa of <Picture 2>'). Each reference makes the job slower: a 1 MP reference adds about a quarter to a 4 MP image, a 4 MP reference doubles it. Returns the result inline and/or saves it to output_path.","inputSchema":{{"type":"object","properties":{{"images":{{"type":"array","items":{{"type":"string"}},"minItems":1,"maxItems":16,"description":"Input images in order (<Picture 1> first): absolute file paths or data: URLs."}},{common}}},"required":["prompt","images"]}}}}]"#
 	)
 }
 
@@ -329,8 +352,7 @@ fn job_of(name: &str, a: &Json) -> Result<Job, String> {
 		(Some(w), Some(h)) if w > 0 && h > 0 => images::check_size(w as usize, h as usize)?,
 		(None, None) => match a.get("aspect").and_then(Json::as_str) {
 			Some(s) => images::aspect_size(s)?,
-			None if name == "edit_image" => (0, 0),
-			None => (1024, 1024),
+			None => (0, 0),
 		},
 		_ => return Err("give both width and height, or aspect".into()),
 	};
@@ -354,11 +376,9 @@ fn job_of(name: &str, a: &Json) -> Result<Job, String> {
 			.get("images")
 			.and_then(Json::as_array)
 			.ok_or("images is required")?;
-		if list.is_empty() || list.len() > imagegen::MAX_IMAGES {
-			return Err(format!(
-				"edit_image takes 1..{} images",
-				imagegen::MAX_IMAGES
-			));
+		let max = images::info().max_images;
+		if list.is_empty() || list.len() > max {
+			return Err(format!("edit_image takes 1..{max} images"));
 		}
 		for v in list {
 			let s = v.as_str().ok_or("images: want strings")?;

@@ -105,16 +105,16 @@ impl Experts {
 		let main = CString::new("main").unwrap();
 		let d = &dev.device;
 		let sm = [
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_xq.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_gu.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_gu32.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_gu16.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_gu8.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_act.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_down.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_down32.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_down16.spv")))?,
-			create_sm(d, &load_spv(include_bytes!("../shaders/exp_down8.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_xq.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_gu.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_gu32.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_gu16.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_gu8.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_act.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_down.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_down32.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_down16.spv")))?,
+			create_sm(d, &load_spv(quant::packed!("exp_down8.spv")))?,
 		];
 		let mut pl = [vk::Pipeline::null(); NK];
 		for (p, &m) in pl.iter_mut().zip(&sm) {

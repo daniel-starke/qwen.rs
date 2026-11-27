@@ -64,7 +64,7 @@ const WIDTH_MASK: usize = (1 << WIDTH_BITS) - 1;
 
 /// `QWEN_POOL_STATS=1`: account where the pool's threads spend their time
 /// (see [`stats`]). Off by default; when off every probe is one relaxed load.
-fn stats_on() -> bool {
+pub fn stats_on() -> bool {
 	static S: OnceLock<bool> = OnceLock::new();
 	*S.get_or_init(|| std::env::var("QWEN_POOL_STATS").is_ok_and(|v| v == "1"))
 }

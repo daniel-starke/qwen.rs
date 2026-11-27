@@ -106,6 +106,116 @@ fn mv_rows(
 	y.chunks_exact(n).map(|v| v.to_vec()).collect()
 }
 
+/// Weights per int4 group scale (`npubuild`'s `Q4G`).
+const Q4G: usize = 32;
+
+/// A routed expert matrix stack: int8 codes per row with f32 row scales,
+/// or int4 codes (even element in the low nibble, value + 8) with an f16
+/// scale per [`Q4G`] weights (`QWEN_FLASH_MTP_Q4=0`: the int8 files).
+enum Ex {
+	I8(Vec<i8>, Vec<f32>),
+	Q4(Vec<u8>, Vec<u16>),
+}
+
+impl Ex {
+	/// `NAME.q4` / `NAME.q4s` where the build wrote them (`q4done`) and
+	/// they are not switched off, else `NAME.i8` / `NAME.s`.
+	fn load(d: &Path, name: &str, n: usize, k: usize) -> Result<Ex, String> {
+		let q4 = d.join("q4done").exists()
+			&& std::env::var("QWEN_FLASH_MTP_Q4").map_or(true, |v| v != "0");
+		if !q4 {
+			let m = M::load(d, name, n, k)?;
+			return Ok(Ex::I8(m.c, m.s));
+		}
+		let rd = |x: &str| {
+			let p = d.join(format!("{name}.{x}"));
+			std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))
+		};
+		let c = rd("q4")?;
+		let s: Vec<u16> = rd("q4s")?
+			.chunks_exact(2)
+			.map(|b| u16::from_le_bytes([b[0], b[1]]))
+			.collect();
+		if c.len() != n * k / 2 || s.len() != n * k / Q4G {
+			return Err(format!("mtp/{name}: not [{n}][{k}] int4"));
+		}
+		Ok(Ex::Q4(c, s))
+	}
+
+	/// Rows `rows` (of `k` weights) times every `xs[p]`.
+	fn mv_rows(&self, k: usize, rows: std::ops::Range<usize>, xs: &[&[f32]]) -> Vec<Vec<f32>> {
+		match self {
+			Ex::I8(c, s) => mv_rows(c, s, k, rows, xs),
+			Ex::Q4(c, s) => mv_rows_q4(c, s, k, rows, xs),
+		}
+	}
+}
+
+/// [`mv_rows`] of int4 rows ([`Ex::Q4`]).
+fn mv_rows_q4(
+	c: &[u8],
+	s: &[u16],
+	k: usize,
+	rows: std::ops::Range<usize>,
+	xs: &[&[f32]],
+) -> Vec<Vec<f32>> {
+	let (n, np) = (rows.len(), xs.len());
+	let mut y = vec![0f32; np * n];
+	#[derive(Clone, Copy)]
+	struct P(*mut f32);
+	unsafe impl Send for P {}
+	unsafe impl Sync for P {}
+	let py = P(y.as_mut_ptr());
+	const RB: usize = 16;
+	let r0 = rows.start;
+	par_for(n.div_ceil(RB), |b| {
+		let py = py;
+		for r in b * RB..((b + 1) * RB).min(n) {
+			let w = &c[(r0 + r) * k / 2..][..k / 2];
+			let sc = &s[(r0 + r) * k / Q4G..][..k / Q4G];
+			for (p, x) in xs.iter().enumerate() {
+				// SAFETY: AVX2 / FMA / F16C checked at load; block b owns
+				// rows [b RB, (b + 1) RB) of every position's output
+				unsafe {
+					*py.0.add(p * n + r) = dot_q4(w, sc, x);
+				}
+			}
+		}
+	});
+	y.chunks_exact(n).map(|v| v.to_vec()).collect()
+}
+
+/// An int4 row ([`Ex::Q4`]: `w` codes, `s` group scales) dotted with `x`.
+///
+/// # Safety
+/// AVX2, FMA and F16C; `x` holds `2 w.len()` values, a multiple of [`Q4G`].
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot_q4(w: &[u8], s: &[u16], x: &[f32]) -> f32 {
+	use core::arch::x86_64::*;
+	let m = _mm_set1_epi8(0x0f);
+	let eight = _mm_set1_epi8(8);
+	let mut acc = _mm256_setzero_ps();
+	for (g, &sh) in s.iter().enumerate() {
+		let b = _mm_loadu_si128(w.as_ptr().add(g * Q4G / 2) as *const __m128i);
+		let lo = _mm_sub_epi8(_mm_and_si128(b, m), eight);
+		let hi = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(b, 4), m), eight);
+		// elements 0..16 and 16..32 in order
+		let e0 = _mm_unpacklo_epi8(lo, hi);
+		let e1 = _mm_unpackhi_epi8(lo, hi);
+		let xp = x.as_ptr().add(g * Q4G);
+		let f = |q: __m128i| _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q));
+		let mut a = _mm256_mul_ps(f(e0), _mm256_loadu_ps(xp));
+		a = _mm256_fmadd_ps(f(_mm_srli_si128(e0, 8)), _mm256_loadu_ps(xp.add(8)), a);
+		a = _mm256_fmadd_ps(f(e1), _mm256_loadu_ps(xp.add(16)), a);
+		a = _mm256_fmadd_ps(f(_mm_srli_si128(e1, 8)), _mm256_loadu_ps(xp.add(24)), a);
+		let d = _mm256_cvtph_ps(_mm_set1_epi16(sh as i16));
+		acc = _mm256_fmadd_ps(a, d, acc);
+	}
+	let mut t = [0f32; 8];
+	_mm256_storeu_ps(t.as_mut_ptr(), acc);
+	t.iter().sum()
+}
+
 fn vecf(d: &Path, name: &str, n: usize) -> Result<Vec<f32>, String> {
 	let p = d.join(format!("{name}.f32"));
 	let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -221,9 +331,9 @@ pub struct Mtp {
 	su: M,
 	sd: M,
 	sgate: Vec<f32>,
-	/// `[NE][2 FE][W]` / `[NE][W][FE]` codes, their row scales
-	egu: (Vec<i8>, Vec<f32>),
-	ed: (Vec<i8>, Vec<f32>),
+	/// `[NE][2 FE][W]` / `[NE][W][FE]`
+	egu: Ex,
+	ed: Ex,
 	/// the attention cache, `[rows][HKV DA]` each (roped keys)
 	kc: Vec<f32>,
 	vc: Vec<f32>,
@@ -233,8 +343,8 @@ impl Mtp {
 	pub fn load(d: &Path) -> Result<Mtp, String> {
 		let t = std::time::Instant::now();
 		let m = |n: &str, r: usize, k: usize| M::load(d, n, r, k);
-		let egu = m("egu", NE * 2 * FE, W)?;
-		let ed = m("ed", NE * W, FE)?;
+		let egu = Ex::load(d, "egu", NE * 2 * FE, W)?;
+		let ed = Ex::load(d, "ed", NE * W, FE)?;
 		let h = Mtp {
 			pne: vecf(d, "pne", W)?,
 			pnh: vecf(d, "pnh", HCW)?,
@@ -254,14 +364,19 @@ impl Mtp {
 			su: m("su", FE, W)?,
 			sd: m("sd", W, FE)?,
 			sgate: vecf(d, "sgate", W)?,
-			egu: (egu.c, egu.s),
-			ed: (ed.c, ed.s),
+			egu,
+			ed,
 			kc: Vec::new(),
 			vc: Vec::new(),
 		};
 		eprintln!(
-			"flash: MTP head loaded in {:.1} s",
-			t.elapsed().as_secs_f64()
+			"flash: MTP head loaded in {:.1} s (experts {})",
+			t.elapsed().as_secs_f64(),
+			if matches!(h.egu, Ex::Q4(..)) {
+				"int4"
+			} else {
+				"int8"
+			}
 		);
 		Ok(h)
 	}
@@ -511,19 +626,13 @@ impl Mtp {
 		}
 		for (e, us) in &users {
 			let ux: Vec<&[f32]> = us.iter().map(|&(p, _)| xs[p]).collect();
-			let gu = mv_rows(
-				&self.egu.0,
-				&self.egu.1,
-				W,
-				e * 2 * FE..(e + 1) * 2 * FE,
-				&ux,
-			);
+			let gu = self.egu.mv_rows(W, e * 2 * FE..(e + 1) * 2 * FE, &ux);
 			let h: Vec<Vec<f32>> = gu
 				.iter()
 				.map(|v| (0..FE).map(|i| silu(v[i]) * v[FE + i]).collect())
 				.collect();
 			let hr: Vec<&[f32]> = h.iter().map(|v| v.as_slice()).collect();
-			let o = mv_rows(&self.ed.0, &self.ed.1, FE, e * W..(e + 1) * W, &hr);
+			let o = self.ed.mv_rows(FE, e * W..(e + 1) * W, &hr);
 			for (&(p, w), o) in us.iter().zip(&o) {
 				for (a, b) in y[p].iter_mut().zip(o) {
 					*a += w * b;

@@ -61,5 +61,8 @@ required-features = ["vulkan"]
 name = "visbench"
 required-features = ["vulkan"]
 
+[build-dependencies]
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
 [lints]
 workspace = true

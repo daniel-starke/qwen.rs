@@ -70,7 +70,7 @@ impl GpuDevice {
 			// --probe --spv` does for the GEMMs).
 			let spv = match std::env::var("QWEN_ATTN_SPV") {
 				Ok(p) => load_spv(&std::fs::read(&p).ok()?),
-				Err(_) => load_spv(include_bytes!("../shaders/attn_prefill.spv")),
+				Err(_) => load_spv(quant::packed!("attn_prefill.spv")),
 			};
 			let sm = create_sm(d, &spv).ok()?;
 			let main = CString::new("main").unwrap();

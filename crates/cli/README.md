@@ -123,12 +123,14 @@ on that GPU). Unknown keys are an error.
 
 The `--serve` / `--prompt-cache-*` / `--image` flags apply as above.
 
-## Image generation (model argument `<qwen-image-dir>`, or `--image-model`)
+## Image generation (model argument `<qwen-image-dir>` or `<h3-image-dir>`, or `--image-model`)
 
-Qwen-Image-2.1 (`docs/image.md`). The model argument is the checkpoint
-directory (the CPU backend, with the text encoder's and the transformer's
-matmuls as Q6_K, `QWEN_IMAGE_WEIGHTS`) or the `image.npu` that `--npu-build`
-writes from it (the NPU backend).
+Qwen-Image-2.1 (`docs/image.md`) or MiniMax-H3-Image (`docs/h3image.md`),
+picked by the checkpoint. The model argument is the checkpoint directory (the
+CPU backend, with the text encoder's and the transformer's matmuls as Q6_K,
+`QWEN_IMAGE_WEIGHTS` on Qwen-Image) or the `image.npu` that `--npu-build`
+writes from it (the NPU backend). MiniMax-H3-Image has 6 fixed steps (no
+`--steps`), a 4 MP default canvas and up to 16 references.
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -137,6 +139,7 @@ writes from it (the NPU backend).
 | `--image-model DIR\|image.npu` | none | With any other `--serve`, it serves the image routes next to chat. The model loads on the first image job and chat waits while one runs. |
 | `--image-out-dir DIR` | none | Repeatable. Where MCP clients may write besides their roots. The first takes files without an `output_path`. |
 | `--image-idle SECS` | 300 | Drop the image model after this long without a job. |
+| `--image-cache DIR` | none (`QWEN_IMAGE_CACHE_DIR`) | MiniMax-H3-Image: keep the converted Q6_K weights here, so a load reads them instead of converting the BF16 checkpoint. Put it on a fast local drive. |
 | `--mcp-stdio [URL]` | `http://127.0.0.1:8080` | First argument, no model. One JSON-RPC message per stdin line is POSTed to `URL/mcp`, with answers (and SSE events) one per stdout line. |
 
 ## `--npu-build` (model argument `<bf16-checkpoint-dir>`)
@@ -445,6 +448,26 @@ All default on unless noted, and `0` turns each one off.
 Further image switches (`QWEN_IMAGE_KV8_*`, `QWEN_IMAGE_ATTN_GPU`,
 `QWEN_IMAGE_NANCHECK`, and the build-time `QWEN_IMAGE_FOLD` /
 `QWEN_IMAGE_W4`) are described in `docs/image.md`.
+
+MiniMax-H3-Image:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `QWEN_IMAGE_CACHE_DIR` | unset | Same as `--image-cache DIR`. |
+| `QWEN_IMAGE_TE_RESERVE_MB` | 8192 | After encoding, the text encoder is dropped when the denoising would leave less available memory than this. |
+| `QWEN_H3_TE_NPU` | on | On the NPU backend, the text encoder runs on the NPU and the iGPU when the set has it. `0` keeps it on the cores. |
+| `QWEN_H3_GPU_BLK` | 0.25 | On the NPU backend, the iGPU's share of each transformer block's chunks. `0` = none. |
+| `QWEN_H3_TE_GPU` | 0.25 | On the NPU backend, the iGPU's share of the text encoder's chunks. `0` = none. |
+| `QWEN_H3_VAE_GPU` | 0.3 | On the NPU backend, the iGPU's share of the VAE decoder's tiles. `0` = none. |
+| `QWEN_H3_ATTN_GPU_SHARE` | fitted | On the NPU backend, the discrete card's share of the transformer's attention rows. `0` turns it off. `QWEN_H3_ATTN_GPU` picks the adapter. |
+| `QWEN_H3_ATTN_GPU_MB` | 1024 | The most VRAM the card's attention share uses during a job. |
+| `QWEN_H3_SMALL` | on | On the NPU backend, each block starts and ends with 64-row jobs when the set has them. `0` = 256-row jobs only. |
+| `QWEN_H3_GPTQ` | on | `--npu-build`: the transformer's int8 weights by GPTQ. `0` rounds to nearest and needs no Hessians. |
+| `QWEN_H3_TE_W4` | unset | `--npu-build`: `mlp` / `all` builds int4 text encoder weights (not recommended; turns off the iGPU share). |
+
+Build-time `QWEN_H3_ACT` and the experiment `QWEN_H3_ATTN_I8` are described
+in `docs/h3image.md`; `QWEN_H3_ATTN_SPV=FILE` loads the card's attention
+kernel from a file (kernel experiments).
 
 ### Measurement / debug (any mode)
 

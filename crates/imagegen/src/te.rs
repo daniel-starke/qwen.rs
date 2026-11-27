@@ -1,34 +1,23 @@
 //! Text encoder: the Qwen3-VL text stack (`text_encoder/`), f32 on the
-//! cores, weights converted from BF16 one layer at a time.
-//!
-//! The prompt is the pipeline's raw template (not `apply_chat_template`):
-//! `<|im_start|>system\n{SYS}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n
-//! <|im_start|>assistant\n`. The output is the **last layer's hidden state
-//! before the final RMSNorm** (transformers 4.x `hidden_states[-1]`, what the
-//! transformer was trained on; 5.x would normalize it), with the system turn
-//! (every token before the second `<|im_start|>`) dropped.
+//! cores, weights converted from BF16 one layer at a time, shared by the
+//! image models (each builds its own prompt: [`crate::qimage::te`],
+//! [`crate::h3::te`]).
 //!
 //! Text-only positions are equal on all three MRoPE axes, so the interleaved
 //! MRoPE is plain rotate-half RoPE at `theta = rope_theta`.
 //!
-//! With condition images (an edit) the user turn starts with
-//! `<image1><|vision_start|>{pads}<|vision_end|>` (and ` <imageN>...` for
-//! each further one; `<imageN>` is plain text). Each image's
-//! `<|image_pad|>` run is one token per 2x2 patch group, embedded as the
-//! vision tower's output rows, at MRoPE positions `(t, t + row, t +
-//! column)`, after which the text resumes at `t + max(rows, columns)`; the
-//! deepstack features are added to those rows after the first text layers
-//! (one merger per layer). The pads stay in the output: the transformer puts
-//! the image's latents at those slots (`Encoded::image_pad`).
+//! An image's `<|image_pad|>` run is one token per 2x2 patch group,
+//! embedded as the vision tower's output rows ([`VisionRows`]), at MRoPE
+//! positions `(t, t + row, t + column)`, after which the text resumes at
+//! `t + max(rows, columns)`; the deepstack features are added to those rows
+//! after the first text layers (one merger per layer).
 
 use crate::config::TeCfg;
 use crate::ops::{self, Lin, WFmt};
+use crate::wcache;
 use npubuild::st::Checkpoint;
 use std::path::Path;
 use tokenizer::Tokenizer;
-
-pub const SYSTEM_PROMPT: &str = "Comprehend and analyze the provided prompt.";
-const IM_START: &str = "<|im_start|>";
 
 pub struct TextEncoder {
 	pub cfg: TeCfg,
@@ -56,6 +45,37 @@ struct Layer {
 }
 
 impl Layer {
+	fn save(&self, w: &mut wcache::Writer) -> Result<(), String> {
+		w.f32s(&self.ln1)?;
+		for l in [&self.q, &self.k, &self.v] {
+			w.lin(l)?;
+		}
+		w.f32s(&self.nq)?;
+		w.f32s(&self.nk)?;
+		w.lin(&self.o)?;
+		w.f32s(&self.ln2)?;
+		for l in [&self.gate, &self.up, &self.down] {
+			w.lin(l)?;
+		}
+		Ok(())
+	}
+
+	fn read(r: &mut wcache::Reader) -> Result<Layer, String> {
+		Ok(Layer {
+			ln1: r.f32s()?,
+			q: r.lin()?,
+			k: r.lin()?,
+			v: r.lin()?,
+			nq: r.f32s()?,
+			nk: r.f32s()?,
+			o: r.lin()?,
+			ln2: r.f32s()?,
+			gate: r.lin()?,
+			up: r.lin()?,
+			down: r.lin()?,
+		})
+	}
+
 	fn bytes(&self) -> usize {
 		[
 			&self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down,
@@ -64,18 +84,6 @@ impl Layer {
 		.map(|l| l.bytes())
 		.sum()
 	}
-}
-
-/// What [`TextEncoder::encode`] returns.
-pub struct Encoded {
-	/// Every token of the template, system turn included.
-	pub ids: Vec<u32>,
-	/// Tokens dropped from the front (the system turn).
-	pub drop: usize,
-	/// `[ids.len() - drop][dim]`.
-	pub hidden: Vec<f32>,
-	/// Per output row: an image slot (`<|image_pad|>`).
-	pub image_pad: Vec<bool>,
 }
 
 /// The condition images as the text encoder sees them: the vision tower's
@@ -137,6 +145,48 @@ impl TextEncoder {
 		Ok(t)
 	}
 
+	/// [`Self::load`] through the weight cache file `file` (`None`: no
+	/// cache): read when it was made from this checkpoint in `fmt`, else
+	/// made after the load (a failed write is reported, not fatal).
+	/// `progress(layer)` after each layer either way.
+	pub fn load_cached(
+		dir: &Path,
+		cfg: &TeCfg,
+		fmt: WFmt,
+		file: Option<&Path>,
+		mut progress: impl FnMut(usize),
+	) -> Result<TextEncoder, String> {
+		let Some(file) = file.filter(|_| fmt != WFmt::F32) else {
+			return Self::load(dir, cfg, fmt, progress);
+		};
+		let key = wcache::key(
+			&dir.join("text_encoder"),
+			&format!("te;{fmt:?};layers {};rot {}", cfg.layers, ops::rot_on()),
+		)?;
+		if let Some(mut r) = wcache::Reader::open(file, &key) {
+			let mut t = Self::open(dir, cfg)?;
+			let mut v = Vec::with_capacity(cfg.layers);
+			for l in 0..cfg.layers {
+				v.push(Layer::read(&mut r)?);
+				progress(l);
+			}
+			t.resident = Some(v);
+			return Ok(t);
+		}
+		let t = Self::load(dir, cfg, fmt, progress)?;
+		let save = || -> Result<(), String> {
+			let mut w = wcache::Writer::create(file, &key)?;
+			for l in t.resident.as_deref().unwrap_or_default() {
+				l.save(&mut w)?;
+			}
+			w.finish()
+		};
+		if let Err(e) = save() {
+			eprintln!("image: text encoder weights not cached: {e}");
+		}
+		Ok(t)
+	}
+
 	pub fn resident_bytes(&self) -> usize {
 		self.resident
 			.as_ref()
@@ -164,54 +214,6 @@ impl TextEncoder {
 			up: lin("mlp.up_proj.weight", c.ffn, d)?,
 			down: lin("mlp.down_proj.weight", d, c.ffn)?,
 		})
-	}
-
-	pub fn template(prompt: &str) -> String {
-		Self::template_images(prompt, &[])
-	}
-
-	/// The template with `<imageN><|vision_start|>`, `tokens[N - 1]` pads
-	/// and `<|vision_end|>` per condition image, space-separated, before the
-	/// prompt.
-	pub fn template_images(prompt: &str, tokens: &[usize]) -> String {
-		// an empty prompt leaves the encoder nothing to read (no BOS)
-		let p = if prompt.is_empty() { " " } else { prompt };
-		let mut img = String::new();
-		for (i, &n) in tokens.iter().enumerate() {
-			if i > 0 {
-				img.push(' ');
-			}
-			img.push_str(&format!("<image{}>", i + 1));
-			img.push_str(&vision::placeholder(n));
-		}
-		format!(
-			"{IM_START}system\n{SYSTEM_PROMPT}<|im_end|>\n{IM_START}user\n{img}{p}<|im_end|>\n{IM_START}assistant\n"
-		)
-	}
-
-	pub fn tokenize(&self, prompt: &str) -> Result<(Vec<u32>, usize), String> {
-		self.tokenize_images(prompt, &[])
-	}
-
-	/// Token ids of [`Self::template_images`] and the system turn's length.
-	pub fn tokenize_images(
-		&self,
-		prompt: &str,
-		tokens: &[usize],
-	) -> Result<(Vec<u32>, usize), String> {
-		let ids = self.tok.encode(&Self::template_images(prompt, tokens));
-		let st = self
-			.tok
-			.token_id(IM_START)
-			.ok_or("tokenizer: no <|im_start|>")?;
-		let drop = ids
-			.iter()
-			.enumerate()
-			.filter(|(_, &t)| t == st)
-			.nth(1)
-			.map(|(i, _)| i)
-			.ok_or("template: no second <|im_start|>")?;
-		Ok((ids, drop))
 	}
 
 	pub fn image_pad_id(&self) -> Result<u32, String> {
@@ -266,32 +268,25 @@ impl TextEncoder {
 		Ok(out)
 	}
 
-	/// Encode `prompt`; `tap(layer, hidden)` sees every layer's output (all
-	/// positions) for the reference checks.
-	pub fn encode(&self, prompt: &str, tap: impl FnMut(usize, &[f32])) -> Result<Encoded, String> {
-		self.encode_images(prompt, None, tap)
+	/// The checkpoint's name of text-stack tensor `name` (`layers.0....`).
+	pub fn tensor(&self, name: &str) -> String {
+		format!("{}{name}", self.pre)
 	}
 
-	/// [`Self::encode`] with condition images (`vis`: the vision tower's rows).
-	/// `tap` sees each layer's output before its deepstack addition.
-	pub fn encode_images(
+	/// The stack's input rows of `ids` (`[s][dim]`: the embeddings, an
+	/// image's `<|image_pad|>` run taking `vis`'s rows in order) and the
+	/// rows of the pads.
+	pub fn inputs(
 		&self,
-		prompt: &str,
+		ids: &[u32],
 		vis: Option<&VisionRows>,
-		mut tap: impl FnMut(usize, &[f32]),
-	) -> Result<Encoded, String> {
-		let c = &self.cfg;
-		let grids: &[(usize, usize)] = vis.map_or(&[], |v| &v.grids);
-		let tokens: Vec<usize> = grids.iter().map(|&(r, c)| r * c).collect();
-		let (ids, drop) = self.tokenize_images(prompt, &tokens)?;
-		let pos = self.positions(&ids, grids)?;
-		let (s, d, hd) = (ids.len(), c.dim, c.head_dim);
-		let nq = c.heads * hd;
+	) -> Result<(Vec<f32>, Vec<usize>), String> {
+		let (s, d) = (ids.len(), self.cfg.dim);
 		let pad = self.image_pad_id()?;
 		let img_rows: Vec<usize> = (0..s).filter(|&p| ids[p] == pad).collect();
-		let emb = format!("{}embed_tokens.weight", self.pre);
+		let emb = self.tensor("embed_tokens.weight");
 		let mut x = Vec::with_capacity(s * d);
-		for &t in &ids {
+		for &t in ids {
 			x.extend(self.ck.rows(&emb, t as usize, t as usize + 1)?);
 		}
 		match vis {
@@ -314,11 +309,16 @@ impl TextEncoder {
 			}
 			None => {}
 		}
+		Ok((x, img_rows))
+	}
 
-		// rotate-half RoPE, pair i at the position of its MRoPE axis
-		let half = hd / 2;
+	/// The rotate-half RoPE's `cos` / `sin` `[s][head_dim / 2]` of the
+	/// MRoPE positions `pos` (pair i at the position of its axis).
+	pub fn rope_tables(&self, pos: &[[i64; 3]]) -> (Vec<f32>, Vec<f32>) {
+		let c = &self.cfg;
+		let (s, half) = (pos.len(), c.head_dim / 2);
 		let inv: Vec<f32> = (0..half)
-			.map(|i| 1.0 / (c.theta as f32).powf((2 * i) as f32 / hd as f32))
+			.map(|i| 1.0 / (c.theta as f32).powf((2 * i) as f32 / c.head_dim as f32))
 			.collect();
 		let mut cos = vec![0f32; s * half];
 		let mut sin = vec![0f32; s * half];
@@ -329,6 +329,27 @@ impl TextEncoder {
 				sin[p * half + i] = a.sin();
 			}
 		}
+		(cos, sin)
+	}
+
+	/// The text stack over token ids `ids` (an image's `<|image_pad|>` run
+	/// takes `vis`'s rows, in order): every row's output of the last layer
+	/// of `cfg.layers`, before the final norm. `tap(layer, hidden)` sees each
+	/// layer's output before its deepstack addition.
+	pub fn encode_ids(
+		&self,
+		ids: &[u32],
+		vis: Option<&VisionRows>,
+		tap: &mut dyn FnMut(usize, &[f32]),
+	) -> Result<Vec<f32>, String> {
+		let c = &self.cfg;
+		let grids: &[(usize, usize)] = vis.map_or(&[], |v| &v.grids);
+		let pos = self.positions(ids, grids)?;
+		let (s, d, hd) = (ids.len(), c.dim, c.head_dim);
+		let nq = c.heads * hd;
+		let (mut x, img_rows) = self.inputs(ids, vis)?;
+		let half = hd / 2;
+		let (cos, sin) = self.rope_tables(&pos);
 		let rope = |v: &mut [f32], heads: usize| {
 			for p in 0..s {
 				for h in 0..heads {
@@ -391,13 +412,6 @@ impl TextEncoder {
 				}
 			}
 		}
-		let hidden = x[drop * d..].to_vec();
-		let image_pad = ids[drop..].iter().map(|&t| t == pad).collect();
-		Ok(Encoded {
-			ids,
-			drop,
-			hidden,
-			image_pad,
-		})
+		Ok(x)
 	}
 }

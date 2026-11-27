@@ -1,3 +1,13 @@
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Keep the build machine out of the binaries: cargo's trim-paths passes
+# `--remap-path-prefix` for the sysroot (-> /rustc/<commit>), the registry
+# (-> <crate>-<version>) and the workspace (-> relative paths), so panic
+# locations and debug info carry no host paths. `deploy` inherits it.
+[unstable]
+trim-paths = true
+
+[profile.release]
+trim-paths = "all"

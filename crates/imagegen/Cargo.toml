@@ -1,6 +1,6 @@
 [package]
 name = "imagegen"
-description = "Qwen-Image-2.1 image generation: configs, scheduler, the CPU reference forward of text encoder, transformer and VAE."
+description = "Image generation: Qwen-Image-2.1 (qimage) and MiniMax-H3-Image (h3) on shared text encoder, job and NPU parts."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

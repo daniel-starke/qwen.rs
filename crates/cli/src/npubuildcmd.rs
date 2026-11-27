@@ -39,9 +39,25 @@ pub fn main(src: &str, args: &[String]) -> i32 {
 		eprintln!("error: --npu-build needs the output directory");
 		return 2;
 	}
+	if npubuild::h3img::is_h3(&o.src) {
+		let cal = |src: &std::path::Path, out: &std::path::Path| {
+			imagegen::h3::npucal::calibrate(src, out, &mut |m| eprintln!("npu-build: {m}"))
+		};
+		let te =
+			|src: &std::path::Path, out: &std::path::Path, accel: &npubuild::weights::Accel| {
+				imagegen::h3::tecal::build(src, out, accel, &mut |m| eprintln!("npu-build: {m}"))
+			};
+		return match npubuild::h3img::build(&o, Some(&cal), Some(&te)) {
+			Ok(()) => 0,
+			Err(e) => {
+				eprintln!("error: {e}");
+				1
+			}
+		};
+	}
 	if npubuild::qimage::is_qwen_image(&o.src) {
 		let cal = |src: &std::path::Path, _out: &std::path::Path, layers: usize| {
-			imagegen::npucal::calibrate(src, layers, &mut |m| eprintln!("npu-build: {m}"))
+			imagegen::qimage::npucal::calibrate(src, layers, &mut |m| eprintln!("npu-build: {m}"))
 		};
 		return match npubuild::qimage::build(&o, Some(&cal)) {
 			Ok(()) => 0,

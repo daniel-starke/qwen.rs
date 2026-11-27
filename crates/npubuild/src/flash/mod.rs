@@ -9,7 +9,7 @@ pub mod sim;
 pub mod weights;
 
 use crate::st::Checkpoint;
-use crate::{calib_chunks, mkdir, say, step_emb, step_tokenizer, Options, FLASH_CALIB};
+use crate::{calib_chunks, flash_calib, mkdir, say, step_emb, step_tokenizer, Options};
 
 /// True when the checkpoint is Qwen3.8-Flash-Next (`model_type` `qwen4_exp`).
 pub fn is_flash(ck: &Checkpoint) -> bool {
@@ -341,7 +341,7 @@ pub fn build(o: &Options, ck: &Checkpoint) -> Result<(), String> {
 		None
 	};
 	if o.wants("weights") {
-		let chunks = calib_chunks(o, &tok, FLASH_CALIB)?;
+		let chunks = calib_chunks(o, &tok, &flash_calib())?;
 		say(&format!(
 			"Flash-Next calibration on {} chunks of {} tokens",
 			chunks.len(),

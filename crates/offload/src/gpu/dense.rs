@@ -39,7 +39,7 @@ impl Dense {
 		let dev = GpuDevice::init_pick(pick)?;
 		let d = &dev.device;
 		let main = CString::new("main").unwrap();
-		let sm = create_sm(d, &load_spv(include_bytes!("../shaders/gemm_f32.spv")))?;
+		let sm = create_sm(d, &load_spv(quant::packed!("gemm_f32.spv")))?;
 		let pl = compute_pipeline(d, dev.aux_pipeline_layout, sm, &main)?;
 		let sizes = [
 			vk::DescriptorPoolSize {

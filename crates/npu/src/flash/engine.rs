@@ -1178,8 +1178,11 @@ fn dense_open(
 	mtp: Option<&Path>,
 ) -> Result<super::gpudec::GpuDec, String> {
 	let mut g = super::gpudec::GpuDec::load(weights, new(need)?)?;
-	if let (Head::I8(c, s), true) = (head, head_gpu) {
-		g.add_head(c, s)?;
+	if let (Head::I8(c, s, r0), true) = (head, head_gpu) {
+		if *r0 != 0 {
+			return Err("flash: the host lm_head lacks rows for the GPU".into());
+		}
+		g.add_head(c, s, head_gpu_rows())?;
 	}
 	if let Some(d) = mtp {
 		g.add_mtp(d)?;
@@ -1234,6 +1237,17 @@ fn head_split(np: usize) -> usize {
 	})
 }
 
+/// The lm_head rows the dense GPU holds: the most row blocks a step's
+/// split runs there ([`head_split`]), at least one more than the drafts'
+/// vocabulary ([`mtp_vblk`], so a draft splits too); the whole head when
+/// either asks for it. The cores compute the rest, so a block past every
+/// split is only VRAM.
+fn head_gpu_rows() -> usize {
+	let full = super::VOCAB.div_ceil(super::gpudec::HEAD_ROWS);
+	let k = (1..=D1_MAX).map(head_split).max().unwrap_or(full);
+	(k.max(mtp_vblk() + 1).min(full) * super::gpudec::HEAD_ROWS).min(super::VOCAB)
+}
+
 /// `QWEN_FLASH_MTP_VBLK`: the MTP drafts' vocabulary, as row blocks of
 /// the GPU lm_head (`gpudec::HEAD_ROWS` = 16384 ids each) from id 0, plus
 /// the special tokens ([`DRAFT_SPECIAL0`] on) on the cores; default 6
@@ -1258,8 +1272,10 @@ const DRAFT_SPECIAL0: usize = 248044;
 /// bytes a decode step reads; `QWEN_FLASH_HEAD=f16` is the A/B).
 enum Head {
 	F16(Vec<u16>),
-	/// codes `[VOCAB][W]`, row scales
-	I8(Vec<i8>, Vec<f32>),
+	/// codes and row scales of rows `[r0, VOCAB)`: all of them, or with the
+	/// head on the dense GPU only the rows the cores take
+	/// ([`FlashEngine::head_slim`])
+	I8(Vec<i8>, Vec<f32>, usize),
 }
 
 /// Token `id`'s embedding row (f32) from the f16 table `emb`.
@@ -1285,6 +1301,11 @@ fn emb_row_from(emb: &std::fs::File, id: u32) -> Result<Vec<f32>, String> {
 /// on (the rest left zero). Each row is read (and converted) once for up
 /// to [`MIX_G`] positions, written straight into the returned rows.
 fn head_rows_host(head: &Head, ms: &[Vec<f32>], r0: usize) -> Vec<Vec<f32>> {
+	assert!(
+		r0 >= head.r0(),
+		"host lm_head rows from {} asked from {r0}",
+		head.r0()
+	);
 	let mut out: Vec<Vec<f32>> = ms.iter().map(|_| vec![0f32; super::VOCAB]).collect();
 	#[derive(Clone, Copy)]
 	struct P(*mut f32);
@@ -1322,7 +1343,7 @@ impl Head {
 	unsafe fn dot(&self, r: usize, m: &[f32]) -> f32 {
 		match self {
 			Head::F16(h) => dot_f16(&h[r * W..][..W], m),
-			Head::I8(c, s) => dot_i8(&c[r * W..][..W], m) * s[r],
+			Head::I8(c, s, r0) => dot_i8(&c[(r - r0) * W..][..W], m) * s[r - r0],
 		}
 	}
 
@@ -1338,7 +1359,8 @@ impl Head {
 					*o = dot_f16(&h[r * W..][..W], m);
 				}
 			}
-			Head::I8(c, s) => {
+			Head::I8(c, s, r0) => {
+				let r = r - r0;
 				let w = &c[r * W..][..W];
 				match ms.len() {
 					1 => dot_i8_np::<1>(w, ms, out),
@@ -1357,17 +1379,84 @@ impl Head {
 		}
 	}
 
-	/// Symmetric int8 per row (max-abs scale) of the f16 rows `h`.
-	fn quantize(h: &[u16]) -> Head {
+	/// The `[VOCAB][W]` f16 file at `path`: as is with `f16`, else int8
+	/// per row ([`Self::quantize_into`]) read in blocks of rows, so the
+	/// load holds the codes and one block, not the f16 table besides.
+	fn read(path: &Path, f16: bool) -> Result<Head, String> {
+		use std::io::Read;
+		let e = |e: std::io::Error| format!("{}: {e}", path.display());
+		let mut f = std::fs::File::open(path).map_err(e)?;
+		let n = f.metadata().map_err(e)?.len() as usize;
+		if n != super::VOCAB * W * 2 {
+			return Err(format!(
+				"{}: not [{}][{W}] f16",
+				path.display(),
+				super::VOCAB
+			));
+		}
+		let mut le = |dst: &mut [u16]| -> Result<(), String> {
+			// SAFETY: u16 has no invalid bit patterns
+			let b = unsafe {
+				std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len() * 2)
+			};
+			f.read_exact(b).map_err(e)?;
+			for v in dst.iter_mut() {
+				*v = u16::from_le(*v);
+			}
+			Ok(())
+		};
+		if f16 {
+			let mut h = vec![0u16; super::VOCAB * W];
+			le(&mut h)?;
+			return Ok(Head::F16(h));
+		}
+		let mut c = vec![0i8; super::VOCAB * W];
+		let mut s = vec![0f32; super::VOCAB];
+		const BLOCK: usize = 8192;
+		let mut h = vec![0u16; BLOCK * W];
+		for r0 in (0..super::VOCAB).step_by(BLOCK) {
+			let nr = BLOCK.min(super::VOCAB - r0);
+			le(&mut h[..nr * W])?;
+			Self::quantize_into(&h[..nr * W], &mut c[r0 * W..][..nr * W], &mut s[r0..][..nr]);
+		}
+		Ok(Head::I8(c, s, 0))
+	}
+
+	/// First row held.
+	fn r0(&self) -> usize {
+		match self {
+			Head::F16(_) => 0,
+			Head::I8(_, _, r0) => *r0,
+		}
+	}
+
+	/// Drop the int8 rows below `r` (none of an f16 head).
+	fn slim(&mut self, r: usize) {
+		if let Head::I8(c, s, r0) = self {
+			if r > *r0 {
+				// in place: a copy would hold both at once
+				let d = r - *r0;
+				c.copy_within(d * W.., 0);
+				c.truncate(c.len() - d * W);
+				c.shrink_to_fit();
+				s.copy_within(d.., 0);
+				s.truncate(s.len() - d);
+				s.shrink_to_fit();
+				*r0 = r;
+			}
+		}
+	}
+
+	/// Symmetric int8 per row (max-abs scale) of the f16 rows `h` into
+	/// codes `c` and row scales `s`.
+	fn quantize_into(h: &[u16], c: &mut [i8], s: &mut [f32]) {
 		let nr = h.len() / W;
-		let mut c = vec![0i8; nr * W];
-		let mut s = vec![0f32; nr];
 		#[derive(Clone, Copy)]
 		struct P(*mut i8, *mut f32);
 		unsafe impl Send for P {}
 		unsafe impl Sync for P {}
 		let p = P(c.as_mut_ptr(), s.as_mut_ptr());
-		const R: usize = 1024;
+		const R: usize = 256;
 		par_for(nr.div_ceil(R), |b| {
 			let p = p;
 			let mut row = [0f32; W];
@@ -1386,7 +1475,6 @@ impl Head {
 				}
 			}
 		});
-		Head::I8(c, s)
 	}
 }
 
@@ -2419,7 +2507,9 @@ pub struct FlashEngine {
 	t_inp: [f64; 2],
 	/// final mixer (f32): norm `[10240]`, down `[320][10240]`, up `[10240][320]`
 	hcf: [Vec<f32>; 3],
-	head: Arc<Head>,
+	head: Head,
+	/// the lm_head's file ([`Self::head_full`])
+	head_path: PathBuf,
 	scan: Option<Box<dyn Scan>>,
 	/// with [`Set::gn`]: per delta layer the gated norm's factors
 	/// ([`Scan::set_gnorm`], [`gn_factors`])
@@ -2655,31 +2745,16 @@ impl FlashEngine {
 			std::thread::scope(|sc| -> Result<_, String> {
 				// lm_head (read, int8), then the dense part on the GPU
 				let th = sc.spawn(|| -> Result<_, String> {
-					let sp = quant::ltime::span(|| "flash: lm_head read".into());
-					let head: Vec<u16> = read(&cfg.head)?
-						.chunks_exact(2)
-						.map(|c| u16::from_le_bytes([c[0], c[1]]))
-						.collect();
-					if head.len() != super::VOCAB * W {
-						return Err(format!(
-							"{}: not [{}][{W}] f16",
-							cfg.head.display(),
-							super::VOCAB
-						));
-					}
-					sp.end();
-					let sp = quant::ltime::span(|| "flash: lm_head int8".into());
-					let head = if head_f16 {
-						Head::F16(head)
-					} else {
-						Head::quantize(&head)
-					};
+					let sp = quant::ltime::span(|| "flash: lm_head read (int8)".into());
+					let head = Head::read(&cfg.head, head_f16)?;
 					sp.end();
 					let _sp = quant::ltime::span(|| "flash: dense part on the GPU".into());
 					let need = match dense {
 						Some(_) => {
-							super::gpudec::GpuDec::need(&cfg.weights, head_gpu)?
-								+ mtp_dir.map_or(0, |_| super::gpudec::GpuDec::mtp_need())
+							super::gpudec::GpuDec::need(
+								&cfg.weights,
+								if head_gpu { head_gpu_rows() } else { 0 },
+							)? + mtp_dir.map_or(0, |_| super::gpudec::GpuDec::mtp_need())
 						}
 						None => 0,
 					};
@@ -2901,7 +2976,7 @@ impl FlashEngine {
 				}
 				let sp = quant::ltime::span(|| "flash: vision tower".into());
 				let vis = match &cfg.vision {
-					Some(d) => Some(crate::vis::NpuVision::load(npu, &d.to_string_lossy())?),
+					Some(d) => Some(crate::vis::NpuVision::open(npu, &d.to_string_lossy())?),
 					None => None,
 				};
 				sp.end();
@@ -2979,7 +3054,7 @@ impl FlashEngine {
 		} else {
 			Vec::new()
 		};
-		let e = FlashEngine {
+		let mut e = FlashEngine {
 			npu,
 			_lock: lock,
 			cur: sets.len() - 1,
@@ -3001,7 +3076,8 @@ impl FlashEngine {
 			pf: Vec::new(),
 			t_inp: [0.0; 2],
 			hcf,
-			head: Arc::new(head),
+			head,
+			head_path: cfg.head.clone(),
 			gnw,
 			cvw,
 			hstate: if scan.is_none() {
@@ -3097,6 +3173,7 @@ impl FlashEngine {
 			mpend: Vec::new(),
 			att_part: Vec::new(),
 		};
+		e.head_slim();
 		eprintln!("flash: loaded in {:.1} s", t0.elapsed().as_secs_f64());
 		Ok(e)
 	}
@@ -4021,7 +4098,7 @@ impl FlashEngine {
 		let t = std::time::Instant::now();
 		let nl = ids.len() - (ids.len() - 1) / sn * sn;
 		let out = if logits {
-			self.head(nl - 1)
+			self.head(nl - 1)?
 		} else {
 			Vec::new()
 		};
@@ -5979,36 +6056,7 @@ impl FlashEngine {
 			Vec::new()
 		} else {
 			let ms = self.mixed_n(&(n - heads.min(n)..n).collect::<Vec<_>>());
-			let mr: Vec<&[f32]> = ms.iter().map(|v| v.as_slice()).collect();
-			let gpu = self.gpu.as_mut().ok_or("flash: no GPU")?;
-			// the GPU's first row blocks while the cores take the rest
-			// (`QWEN_FLASH_HEAD_SPLIT` = blocks on the GPU)
-			let k = head_split(ms.len()).min(gpu.head_blocks());
-			if k > 0 && k < gpu.head_blocks() {
-				let r0 = k * super::gpudec::HEAD_ROWS;
-				gpu.head_begin(&mr, k)?;
-				let mut outs = {
-					let _w = quant::parallel::limit_width(quant::parallel::decode_threads());
-					self.head_ms_from(&ms, r0)
-				};
-				let gpu = self.gpu.as_mut().ok_or("flash: no GPU")?;
-				gpu.head_wait(&mut outs, r0)?;
-				outs
-			} else {
-				match gpu.head_n(&mr)? {
-					Some(v) if std::env::var("QWEN_FLASH_HEAD_CHECK").is_ok() => {
-						let h = self.head(0);
-						let d = v[0]
-							.iter()
-							.zip(&h)
-							.fold(0f32, |a, (x, y)| a.max((x - y).abs()));
-						eprintln!("[flash] head check: max |gpu - host| {d:.2e}");
-						v
-					}
-					Some(v) => v,
-					None => self.head_rows(&(n - heads.min(n)..n).collect::<Vec<_>>()),
-				}
-			}
+			self.head_logits(&ms)?
 		};
 		if self.timing {
 			let ph: Vec<f64> = super::cpuexp::T_PHASE
@@ -6880,6 +6928,7 @@ impl FlashEngine {
 						t.elapsed().as_secs_f64()
 					);
 					self.gpu = Some(g);
+					self.head_slim();
 					self.dense_since = Some(std::time::Instant::now());
 					self.dense_retry = None;
 					self.dense_base = [f64::INFINITY; 9];
@@ -6928,6 +6977,10 @@ impl FlashEngine {
 			}
 		}
 		self.gpu = None;
+		if let Err(e) = self.head_full() {
+			eprintln!("flash: the host lm_head is incomplete ({e})");
+			self.lost = true;
+		}
 		self.spec = None;
 		self.mtp_clear();
 		self.dense_retry = dense_retry_at(self.dense_backoff);
@@ -7070,9 +7123,88 @@ impl FlashEngine {
 		Ok(())
 	}
 
-	/// The logits of chunk row `t`: final mixer, lm_head (host, f32).
-	fn head(&self, t: usize) -> Vec<f32> {
-		self.head_rows(&[t]).remove(0)
+	/// The logits of chunk row `t`: final mixer, lm_head.
+	fn head(&mut self, t: usize) -> Result<Vec<f32>, String> {
+		Ok(self.head_rows(&[t])?.remove(0))
+	}
+
+	/// The logits of final mixer outputs `ms`: with the lm_head on the
+	/// dense GPU its first row blocks there while the cores take the rest
+	/// (`QWEN_FLASH_HEAD_SPLIT` = blocks on the GPU), else the host's.
+	fn head_logits(&mut self, ms: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+		if self.gpu.as_ref().is_none_or(|g| g.head_blocks() == 0) {
+			return Ok(self.head_ms(ms));
+		}
+		// a GPU run takes at most a verify step's positions
+		let mut out = Vec::with_capacity(ms.len());
+		for g in ms.chunks(D1_MAX) {
+			out.extend(self.head_logits_gpu(g)?);
+		}
+		Ok(out)
+	}
+
+	/// [`Self::head_logits`] of at most [`D1_MAX`] positions on the GPU.
+	fn head_logits_gpu(&mut self, ms: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+		let mr: Vec<&[f32]> = ms.iter().map(|v| v.as_slice()).collect();
+		let gpu = self.gpu.as_mut().ok_or("flash: no GPU")?;
+		let k = head_split(ms.len()).min(gpu.head_blocks());
+		if k > 0 && k * super::gpudec::HEAD_ROWS < super::VOCAB {
+			let r0 = k * super::gpudec::HEAD_ROWS;
+			gpu.head_begin(&mr, k)?;
+			let mut outs = {
+				let _w = quant::parallel::limit_width(quant::parallel::decode_threads());
+				self.head_ms_from(ms, r0)
+			};
+			let gpu = self.gpu.as_mut().ok_or("flash: no GPU")?;
+			gpu.head_wait(&mut outs, r0)?;
+			return Ok(outs);
+		}
+		let v = gpu.head_n(&mr)?.ok_or("flash: no GPU lm_head")?;
+		if std::env::var("QWEN_FLASH_HEAD_CHECK").is_ok() {
+			let r0 = self.head.r0();
+			let h = self.head_ms_from(&ms[..1], r0).remove(0);
+			let d = v[0][r0..]
+				.iter()
+				.zip(&h[r0..])
+				.fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+			eprintln!("[flash] head check: max |gpu - host| {d:.2e} (rows from {r0})");
+		}
+		Ok(v)
+	}
+
+	/// The first host lm_head row the cores need while the dense GPU holds
+	/// the head: [`head_split`]'s fewest GPU blocks, at most the drafts'
+	/// special tokens ([`DRAFT_SPECIAL0`]).
+	fn head_keep() -> usize {
+		let k = (1..=D1_MAX).map(head_split).min().unwrap_or(0);
+		let r = DRAFT_SPECIAL0 / super::gpudec::HEAD_ROWS * super::gpudec::HEAD_ROWS;
+		if k == 0 {
+			r
+		} else {
+			(k * super::gpudec::HEAD_ROWS).min(r)
+		}
+	}
+
+	/// With the lm_head on the dense GPU, drop the host rows below
+	/// [`Self::head_keep`] (the GPU computes them).
+	fn head_slim(&mut self) {
+		if self.gpu.as_ref().is_some_and(|g| g.head_blocks() > 0) {
+			self.head.slim(Self::head_keep());
+		}
+	}
+
+	/// The whole host lm_head again (read from its file), for decode
+	/// without the dense GPU and to upload it to a new one.
+	fn head_full(&mut self) -> Result<(), String> {
+		if self.head.r0() > 0 {
+			let t = std::time::Instant::now();
+			self.head = Head::read(&self.head_path, false)?;
+			eprintln!(
+				"flash: host lm_head read again ({:.1} s)",
+				t.elapsed().as_secs_f64()
+			);
+		}
+		Ok(())
 	}
 
 	/// The final mixer's outputs of chunk rows `ts`: in groups of
@@ -7158,9 +7290,9 @@ impl FlashEngine {
 	}
 
 	/// The logits of chunk rows `ts` (one pass over the lm_head).
-	fn head_rows(&self, ts: &[usize]) -> Vec<Vec<f32>> {
+	fn head_rows(&mut self, ts: &[usize]) -> Result<Vec<Vec<f32>>, String> {
 		let ms = self.mixed_n(ts);
-		self.head_ms(&ms)
+		self.head_logits(&ms)
 	}
 
 	/// The logits of final mixer outputs `ms` (host lm_head).
@@ -7436,7 +7568,7 @@ impl FlashEngine {
 			for (n, x) in std::mem::take(&mut self.xfin) {
 				self.buf(B::x).as_mut_slice()[..x.len()].copy_from_slice(&x);
 				let ts: Vec<usize> = (0..n).collect();
-				all.extend(self.head_rows(&ts));
+				all.extend(self.head_rows(&ts)?);
 			}
 		}
 		bar.done();

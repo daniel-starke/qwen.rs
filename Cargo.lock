@@ -73,7 +73,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cli"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gguf",
  "imagegen",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "gguf"
-version = "1.0.1"
+version = "1.1.0"
 
 [[package]]
 name = "image"
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "imagegen"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "imgio",
  "npu",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "imgio"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "image",
 ]
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gguf",
  "offload",
@@ -226,8 +226,9 @@ dependencies = [
 
 [[package]]
 name = "npu"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
+ "miniz_oxide 0.9.1",
  "ov",
  "quant",
  "sampler",
@@ -235,9 +236,10 @@ dependencies = [
 
 [[package]]
 name = "npubuild"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "imgio",
+ "miniz_oxide 0.9.1",
  "npu",
  "offload",
  "ov",
@@ -257,15 +259,16 @@ dependencies = [
 
 [[package]]
 name = "offload"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "ash",
+ "miniz_oxide 0.9.1",
  "quant",
 ]
 
 [[package]]
 name = "ov"
-version = "1.0.1"
+version = "1.1.0"
 
 [[package]]
 name = "png"
@@ -282,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "prefixcache"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "quant",
 ]
@@ -295,9 +298,10 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "quant"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gguf",
+ "miniz_oxide 0.9.1",
 ]
 
 [[package]]
@@ -319,15 +323,16 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "sampler"
-version = "1.0.1"
+version = "1.1.0"
 
 [[package]]
 name = "server"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gguf",
  "imagegen",
  "imgio",
+ "miniz_oxide 0.9.1",
  "model",
  "prefixcache",
  "quant",
@@ -344,15 +349,16 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "tokenizer"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "fancy-regex",
  "gguf",
+ "regex-syntax",
 ]
 
 [[package]]
 name = "vision"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "gguf",
  "imgio",

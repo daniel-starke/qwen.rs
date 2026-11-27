@@ -1,7 +1,7 @@
 #version 450
 // Attention of the Qwen-Image transformer on the scan device (the iGPU,
 // `offload::DitAttn`): 32 heads of 128, every query over keys [0, nk), no
-// mask (the target rows; `imagegen::npudit` gives the iGPU a share of
+// mask (the target rows; `imagegen::qimage::npudit` gives the iGPU a share of
 // each block's query chunks while the cores run the rest). One pass, an
 // online softmax over tiles of 128 keys; the layout of
 // `flash_attn_npu.glsl` with G queries of one head per workgroup in place

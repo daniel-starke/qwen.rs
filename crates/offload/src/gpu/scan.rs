@@ -133,19 +133,13 @@ impl DeltaScan {
 			.ok_or("the Vulkan device has no VK_EXT_external_memory_host")?;
 		let sm = create_sm(
 			&dev.device,
-			&load_spv(include_bytes!("../shaders/delta_prefill_npu.spv")),
+			&load_spv(quant::packed!("delta_prefill_npu.spv")),
 		)?;
 		let main = CString::new("main").unwrap();
 		let pipeline = compute_pipeline(&dev.device, dev.aux_pipeline_layout, sm, &main)?;
-		let gn_sm = create_sm(
-			&dev.device,
-			&load_spv(include_bytes!("../shaders/gn_npu.spv")),
-		)?;
+		let gn_sm = create_sm(&dev.device, &load_spv(quant::packed!("gn_npu.spv")))?;
 		let gn_pl = compute_pipeline(&dev.device, dev.aux_pipeline_layout, gn_sm, &main)?;
-		let cv_sm = create_sm(
-			&dev.device,
-			&load_spv(include_bytes!("../shaders/conv_npu.spv")),
-		)?;
+		let cv_sm = create_sm(&dev.device, &load_spv(quant::packed!("conv_npu.spv")))?;
 		let cv_pl = compute_pipeline(&dev.device, dev.aux_pipeline_layout, cv_sm, &main)?;
 		let sizes = [
 			vk::DescriptorPoolSize {
@@ -187,13 +181,13 @@ impl DeltaScan {
 		);
 		let far_spv: [&[u8]; 2] = if fused {
 			[
-				include_bytes!("../shaders/attn_far_qks_npu.spv"),
-				include_bytes!("../shaders/attn_far_pv_npu.spv"),
+				quant::packed!("attn_far_qks_npu.spv"),
+				quant::packed!("attn_far_pv_npu.spv"),
 			]
 		} else {
 			[
-				include_bytes!("../shaders/attn_far_qk_npu.spv"),
-				include_bytes!("../shaders/attn_far_npu.spv"),
+				quant::packed!("attn_far_qk_npu.spv"),
+				quant::packed!("attn_far_npu.spv"),
 			]
 		};
 		let far_sm = [

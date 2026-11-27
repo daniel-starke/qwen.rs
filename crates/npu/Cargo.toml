@@ -19,5 +19,8 @@ ov = { path = "../ov" }
 quant = { path = "../quant" }
 sampler = { path = "../sampler" }
 
+[build-dependencies]
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
 [lints]
 workspace = true

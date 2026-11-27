@@ -3,7 +3,7 @@
 //!
 //! WHY
 //! ---
-//! `imagegen::npudit` runs the transformer's per-token work on the NPU and
+//! `imagegen::qimage::npudit` runs the transformer's per-token work on the NPU and
 //! the attention (target rows over [prefix, target] keys) on the cores,
 //! chunk by chunk, overlapped. In an edit the reference images' rows make
 //! the attention the longer part (1 MP, one reference: 132 s of the
@@ -61,7 +61,7 @@ impl DitAttn {
 		// `QWEN_DIT_ATTN_SPV=FILE` (kernel experiments): a build from disk
 		let spv = match std::env::var_os("QWEN_DIT_ATTN_SPV") {
 			Some(f) => std::fs::read(&f).map_err(|e| format!("{}: {e}", f.to_string_lossy()))?,
-			None => include_bytes!("../shaders/dit_attn_npu.spv").to_vec(),
+			None => quant::packed!("dit_attn_npu.spv").to_vec(),
 		};
 		let sm = create_sm(&dev.device, &load_spv(&spv))?;
 		let pl = compute_pipeline(&dev.device, dev.aux_pipeline_layout, sm, &main)?;

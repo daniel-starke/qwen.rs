@@ -35,8 +35,9 @@ mod gpu;
 #[cfg(feature = "vulkan")]
 pub use gpu::{
 	host_import_budget, host_imported, DeltaScan, Dense, DitAttn, DitBlk, DitMid, Experts,
-	FlashAttn, Gemv, GemvMat, HcPre, MlpSplit, Region, VisAttn, DELTA_STATE, DELTA_WIN, EXP_SLOT,
-	GEMV_NP, GEMV_WAVE, GEMV_X, GEMV_Y, HC_MAXN,
+	FlashAttn, Gemv, GemvMat, H3Attn, H3Blk, H3Mid, H3Vae, H3VaeShape, HcPre, MlpSplit, Region,
+	VisAttn, DELTA_STATE, DELTA_WIN, EXP_SLOT, GEMV_NP, GEMV_WAVE, GEMV_X, GEMV_Y, H3_A,
+	H3_ATTN_SLOTS, H3_D, H3_FF, H3_SLOTS, HC_MAXN,
 };
 
 #[cfg(test)]

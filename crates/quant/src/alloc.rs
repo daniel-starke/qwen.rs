@@ -83,6 +83,8 @@ pub struct RecyclingAlloc {
 	lock: AtomicBool,
 	slots: std::cell::UnsafeCell<[Slot; SLOTS]>,
 	held: AtomicUsize,
+	/// most bytes `held` reached ([`held`])
+	peak: AtomicUsize,
 	clock: AtomicUsize,
 	/// Byte bound, resolved on first use (`usize::MAX` = not yet read).
 	cap: AtomicUsize,
@@ -97,6 +99,7 @@ impl RecyclingAlloc {
 			lock: AtomicBool::new(false),
 			slots: std::cell::UnsafeCell::new([EMPTY; SLOTS]),
 			held: AtomicUsize::new(0),
+			peak: AtomicUsize::new(0),
 			clock: AtomicUsize::new(0),
 			cap: AtomicUsize::new(usize::MAX),
 		}
@@ -182,6 +185,7 @@ impl RecyclingAlloc {
 				slots[old] = EMPTY;
 			};
 			self.held.store(held, Ordering::Relaxed);
+			self.peak.fetch_max(held, Ordering::Relaxed);
 			kept
 		});
 		for s in &evicted[..n_ev] {
@@ -207,6 +211,24 @@ impl Default for RecyclingAlloc {
 /// The global instance, once it has allocated (for [`trim`]).
 static INSTANCE: std::sync::atomic::AtomicPtr<RecyclingAlloc> =
 	std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// The cache's idle blocks: (bytes held now, the most bytes held so far,
+/// blocks held now); zeros when the recycling allocator is not the global
+/// allocator.
+pub fn held() -> (usize, usize, usize) {
+	let p = INSTANCE.load(Ordering::Acquire);
+	if p.is_null() {
+		return (0, 0, 0);
+	}
+	// SAFETY: set from `&self` of the global allocator, a static.
+	let a = unsafe { &*p };
+	let n = a.with_slots(|slots| slots.iter().filter(|s| s.ptr != 0).count());
+	(
+		a.held.load(Ordering::Relaxed),
+		a.peak.load(Ordering::Relaxed),
+		n,
+	)
+}
 
 /// Return every cached block to the OS (after dropping a model: the cache
 /// would otherwise hold up to its bound of idle memory). Returns the bytes

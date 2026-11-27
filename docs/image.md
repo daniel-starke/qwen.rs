@@ -318,7 +318,7 @@ The memory budget while loaded at 1 MP is **<= 24 GB RAM, 0 VRAM**.
 weight is read from the BF16 checkpoint per layer (per use, as the DiT's 32
 blocks are re-read each step), so RSS stays at one layer plus activations.
 
-Facts the port pins (each checked by `crates/imagegen/tests/reference.rs`):
+Facts the port pins (each checked by `crates/imagegen/tests/qimage_reference.rs`):
 
 - **Text encoder output** is the last layer **before** the final RMSNorm
   (transformers 5.x normalizes it, giving wrong conditioning and no error). The system
@@ -368,10 +368,10 @@ GEMMs, and the CPU backend (quantized) and the NPU backend replace both.
 
 `imagegen::cond` prepares the condition images,
 `vision::tower::forward_deep` and `npubuild::vis::model_deepstack` run the
-text encoder's vision tower, `te::TextEncoder::encode_images` the text stack with them,
-`vae::Vae::encode` their latents, `dit::layout` the joint sequence, and
-`pipeline::generate` drives text-to-image and edits alike. Facts the port
-pins (each checked by `crates/imagegen/tests/edit.rs`):
+text encoder's vision tower, `TextEncoder::encode_images` (`imagegen::qimage::te`) the text stack with them,
+`qimage::vae::Vae::encode` their latents, `qimage::dit::layout` the joint sequence, and
+`qimage::pipeline::generate` drives text-to-image and edits alike. Facts the port
+pins (each checked by `crates/imagegen/tests/qimage_edit.rs`):
 
 - **One resize feeds both encoders.** Each image is converted to RGBA and
   resized with Pillow's **Lanczos** to `calculate_dimensions(res^2,
@@ -441,12 +441,12 @@ Several references were tested with three images (1024x1024, 1024x1024,
 of image 3". Every resized image is byte-identical to Pillow, with text encoder
 3.1e-6, vision embeddings 2.5e-5 / deepstack <= 1.8e-5, VAE encoder
 stages <= 1.4e-7 rel. at `conv_in`, velocity steps 0-7 <= 3.3e-5, VAE
-decoder 7.2e-7 (`tests/edit.rs` on a `refdump.py --image A --image B
+decoder 7.2e-7 (`tests/qimage_edit.rs` on a `qimage_refdump.py --image A --image B
 --image C` dump, 278 s).
 
 ### Quantized backend
 
-In `imagegen::Model` (`QWEN_IMAGE_WEIGHTS`), the text
+In `imagegen::qimage::Model` (`QWEN_IMAGE_WEIGHTS`), the text
 encoder's and the transformer's matmuls are converted from BF16 to **Q6_K
 once at load** (`imagegen::ops::Lin`, ~18 s for both, 5.7 + 5.7 GB) and
 run by `quant`'s Q6_K GEMMs (AVX-VNNI) on q8_K activations, while the vision
@@ -488,7 +488,7 @@ unrotated 20.0 dB / 18 %, and Q4_K 20.3 dB / 35 %.
   shape (`quant` `bench_attn_block_mha`), it reaches 295 GFLOP/s at 12 positions, 959
   at 48, 1531 at 192, 1596 at 384, 1608 at 768, and takes 6.3 s per 1 MP step.
 - **VAE.** A 3x3 convolution builds its padded input per band of rows
-  (`vae::conv3_rows`, 64 MB bands) from a row source, and an upsampling
+  (`qimage::vae::conv3_rows`, 64 MB bands) from a row source, and an upsampling
   block's conv reads the low-resolution map directly (`conv_up2`), so
   neither a whole padded copy (2.4 GB at the last upsampling block at 1
   MP) nor the 2x upsampled map exists.
@@ -517,7 +517,7 @@ text encoder with the vision tower 33.6 s, VAE encoder 6.5 s, transformer
 Build steps (`npubuild::qimage::build`), each skipped when its output
 exists:
 
-- `cal` holds the activation ranges (`OUT/cal/dit.cal`, `imagegen::npucal`). The
+- `cal` holds the activation ranges (`OUT/cal/dit.cal`, `imagegen::qimage::npucal`). The
   Q6_K CPU backend generates four calibration images (512x512 / 640x384 /
   448x576) while every block records the largest magnitude of its rotated
   QKV, out and gate / up inputs over the prefix and target rows of all
@@ -541,12 +541,12 @@ value is a bound input), `dit_pre` (block 0 up to its attention, q, k, v),
 scale1`, `gate1`, `1 + scale2`, `gate2`) is an input too, and the prefix
 runs through the same graphs at its own modulation (t = 0). q / k / v
 leave the graph raw (before their row scales), and the cores apply q / k's
-row scales, head norms and RoPE in f32 (`imagegen::npudit::qk_finish`,
+row scales, head norms and RoPE in f32 (`imagegen::qimage::npudit::qk_finish`,
 block l's K once all its chunks are done, each chunk's q with its
 attention), and v's row scales are folded into `o.pre` (a per-channel
 factor of V passes through the attention).
 
-The engine (`imagegen::npudit`) runs one submission of every chunk per
+The engine (`imagegen::qimage::npudit`) runs one submission of every chunk per
 layer (`batch_each`, with each argument is bound at its chunk's offset in
 image-sized host buffers, so nothing is copied between jobs). The block's
 attention runs on the cores, overlapped chunk by chunk (`quant::attn_block`
@@ -621,11 +621,11 @@ with `NPU_RS_DPU1LIST=1 NPU_RS_VIEWFOLD=1 NPU_RS_DISTVIEW=1
 NPU_RS_GMM_MAXG=96`, then `NPU_TASKS=1 npubench blob X --profile` and
 `scripts/tasks.py`. `examples/qigraph` writes the graphs.
 
-**Per-stage reference data** (`crates/imagegen/examples/stageref.rs`).
-`stageref record REF QWEN_IMAGE_DIR [--size N]` writes the f32
+**Per-stage reference data** (`crates/imagegen/examples/qimage_stageref.rs`).
+`qimage_stageref record REF QWEN_IMAGE_DIR [--size N]` writes the f32
 reference's stages (text encoder output, prefix rows, modulation, the
 target rows after every block of the first and the last step, every
-step's latents and velocity, the final latents and image), and `stageref
+step's latents and velocity, the final latents and image), and `qimage_stageref
 check REF MODEL [--free]` runs a backend (a checkpoint directory = the
 Q6_K CPU backend, or an `image.npu`) on the recorded inputs, stage by
 stage, with times, and with `--free` the whole denoising from the recorded
@@ -633,10 +633,10 @@ noise against the reference image. The sets used here are `s256` (one NPU
 chunk, 132 MB, recorded in 2 min) and `s512` (four chunks, 519 MB, 5 min),
 with the prompt "A red fox sitting in a snowy forest at dawn, soft golden
 light, photograph" and seed 42. `QWEN_IMAGE_NANCHECK=1` prints the
-non-finite values per block of the NPU forward. `examples/ditstats.rs` prints the
+non-finite values per block of the NPU forward. `examples/qimage_ditstats.rs` prints the
 residual stream's largest values per block.
 
-The gate (`stageref check s512 MODEL --free`, 512x512 = 1024 target tokens,
+The gate (`qimage_stageref check s512 MODEL --free`, 512x512 = 1024 target tokens,
 24 prompt tokens kept, 8 steps, the transformer fed the recorded f32
 text-encoder output):
 
@@ -675,7 +675,7 @@ text-encoder tokens, a 4118-row prefix):
 | edit, VAE encoder | **2.3 s** | stride-1 3x3 convs on the NPU |
 | peak working set, text to image / edit | 21.0 / **23.7 GB** | (at the VAE decoder) |
 
-**NPU and attention overlapped** (`imagegen::npudit::pipeline`). Per
+**NPU and attention overlapped** (`imagegen::qimage::npudit::pipeline`). Per
 block, once every chunk has its q / k / v, the cores run chunk c's
 attention and the next graph's chunk c goes to the NPU, which runs it
 while the cores do chunk c + 1. K / V are double-buffered (block l + 1's
@@ -721,7 +721,7 @@ weight reads, not the dp4a rate (the same dispatch on registers only takes
 64 / 128 rows per lane group, weights straight from global memory,
 token tiles adjacent in the grid and non-saturating dot products were
 all no faster (more registers spill).
-- Which chunks (`npudit::gpu_chunk`). The NPU takes chunk 0, and the iGPU's
+- Which chunks (`qimage::npudit::gpu_chunk`). The NPU takes chunk 0, and the iGPU's
   are spread from chunk 1 on (5 of 16, namely 1, 4, 7, 10, 13), so both start
   after the first chunks' attention. Its first `F` chunks as one
   submission after their attention left the NPU and the iGPU idle for
@@ -782,10 +782,10 @@ stay between two blocks. For 1 MP text to image, 9 steps, the boundary time goes
   whose V is ~14x smaller than the rest. A V scale per channel (over all
   keys or per 64-key block) gave 5-13e-2 there, one per key 1e-2, and without
   the rotation Q.K alone is 6-11e-3.
-- The gate (`stageref check s512 --free`) gives velocity steps 0-7 1.97-2.74e-2
+- The gate (`qimage_stageref check s512 --free`) gives velocity steps 0-7 1.97-2.74e-2
   (f32 1.86-2.89e-2), image 32.6 dB (33.3), and `k` 1.93-3.23e-2, 31.0 dB.
 
-**VAE on the NPU** (`npubuild::qvae` for graphs, `imagegen::npuvae` for the
+**VAE on the NPU** (`npubuild::qvae` for graphs, `imagegen::qimage::npuvae` for the
 engine). Every 3x3 stride-1 convolution of the decoder and the encoder runs as
 f16 graphs over 32x32 tiles with a one-pixel halo (16 kinds by channel
 counts). RMS norm, SiLU, up- / downsampling, `conv_in` and the
@@ -808,10 +808,10 @@ the cores' tower rel. 3.2e-2, deepstack 0.6 / 1.3 / 2.2e-2. The edit
 images with either tower reach PSNR 40.2 dB (512x512), far inside the
 transformer's own trajectory noise. Loaded on the first edit and kept.
 
-**Many reference images** (up to `imagegen::MAX_IMAGES` = 10 in every
+**Many reference images** (up to `imagegen::qimage::MAX_IMAGES` = 10 in every
 interface, and each keeps its `--resolution` area, never shrunk). The prefix
 grows by ~4.1k rows per 1 MP reference, its K / V by ~2.2 GB in f16
-(`32 x 2 x rows x 4096 x 2 B`). In `pipeline::prefix_plan`, the K / V plus
+(`32 x 2 x rows x 4096 x 2 B`). In `qimage::pipeline::prefix_plan`, the K / V plus
 the prefix pass' buffers may take `QWEN_IMAGE_PREFIX_MB` (default 6144)
 next to the text encoder. Beyond that the prefix K / V are **int8 with a
 scale per row and head, rotated per head** (`H (s x)`, `H` the normalized
@@ -888,14 +888,14 @@ dense.
 
 | Part | Gate |
 |---|---|
-| CPU reference (text to image) | per-module tensors vs diffusers on the same inputs (rel. error < 1e-3 in f32), and a 512x512 image matching diffusers' for the same seed and noise (`tests/reference.rs`) |
-| Edits | the same for preprocessing (Pillow-exact), vision tower with deepstack, text encoder with images, VAE encoder, slots, reference RoPE, with one and several references (`tests/edit.rs`) |
+| CPU reference (text to image) | per-module tensors vs diffusers on the same inputs (rel. error < 1e-3 in f32), and a 512x512 image matching diffusers' for the same seed and noise (`tests/qimage_reference.rs`) |
+| Edits | the same for preprocessing (Pillow-exact), vision tower with deepstack, text encoder with images, VAE encoder, slots, reference RoPE, with one and several references (`tests/qimage_edit.rs`) |
 | Server | MCP (tools, progress, cancel, roots), `/v1/images/*`, `--mcp-stdio` end to end with a client (Zed) |
-| CPU and NPU backends | `stageref check REF MODEL --free` compares every stage vs the f32 reference ("NPU backend") |
+| CPU and NPU backends | `qimage_stageref check REF MODEL --free` compares every stage vs the f32 reference ("NPU backend") |
 
 Reference tensors for the gates come from diffusers in ComfyUI's embedded
 Python (`python_embeded`, CPU, f32) through
-`crates/imagegen/scripts/refdump.py`, dumped to a scratch directory.
+`crates/imagegen/scripts/qimage_refdump.py`, dumped to a scratch directory.
 
 The server is checked by `cargo test -p server` (`images::tests`,
 `mcp::tests`, covering sizes, write paths, multipart, base64, the JSON-RPC routes
@@ -974,7 +974,7 @@ The image path is built on components the chat engines use too:
 | NPU graph building, compile, sets | `npubuild::{g, sets}`, the compiler flags (`npubuild::sets`) |
 | NPU execution, host buffers, NPU lock | `npu::{ze, engine}`, `ov::lock` |
 | iGPU attention / imports | `offload::VisAttn`, `offload::DitAttn`, `gpu/hostimp.rs` |
-| VAE 3x3 convs on the NPU (graphs / engine) | `npubuild::qvae`, `imagegen::npuvae` (the only convolution graphs, since the 27B's tower graphs are matmuls only) |
+| VAE 3x3 convs on the NPU (graphs / engine) | `npubuild::qvae`, `imagegen::qimage::npuvae` (the only convolution graphs, since the 27B's tower graphs are matmuls only) |
 | HTTP, hand-written JSON, SSE | `crates/server` (`lib.rs`, `openai.rs`) |
 | Progress output, load timing | `quant::progress`, `quant::ltime` |
 | Block-causal attention (DiT image blocks, VAE mid attention) | `quant::attn_block` (the tiled `attn_causal` kernel with every key of the query's block visible) |

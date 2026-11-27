@@ -67,21 +67,37 @@ fn box_muller16(d: &mut [f32]) {
 /// `n` standard normal floats as `torch.randn(n)` on a CPU generator
 /// seeded with `seed` (`n` >= 16).
 pub fn torch_randn(seed: u64, n: usize) -> Vec<f32> {
-	assert!(n >= 16);
-	// torch seeds mt19937 with the low 32 bits of the 64-bit seed
-	let mut g = Mt19937::new(seed as u32);
-	let mut d: Vec<f32> = (0..n).map(|_| g.uniform()).collect();
-	for b in (0..n - 15).step_by(16) {
-		box_muller16(&mut d[b..b + 16]);
+	TorchGen::new(seed).randn(n)
+}
+
+/// A CPU `torch.Generator` after `manual_seed(seed)`: successive
+/// [`Self::randn`] calls draw what successive `torch.randn(..., generator=g)`
+/// calls draw.
+pub struct TorchGen(Mt19937);
+
+impl TorchGen {
+	pub fn new(seed: u64) -> TorchGen {
+		// torch seeds mt19937 with the low 32 bits of the 64-bit seed
+		TorchGen(Mt19937::new(seed as u32))
 	}
-	if !n.is_multiple_of(16) {
-		let b = n - 16;
-		for v in &mut d[b..] {
-			*v = g.uniform();
+
+	/// `n` standard normal floats (`n` >= 16).
+	pub fn randn(&mut self, n: usize) -> Vec<f32> {
+		assert!(n >= 16);
+		let g = &mut self.0;
+		let mut d: Vec<f32> = (0..n).map(|_| g.uniform()).collect();
+		for b in (0..n - 15).step_by(16) {
+			box_muller16(&mut d[b..b + 16]);
 		}
-		box_muller16(&mut d[b..]);
+		if !n.is_multiple_of(16) {
+			let b = n - 16;
+			for v in &mut d[b..] {
+				*v = g.uniform();
+			}
+			box_muller16(&mut d[b..]);
+		}
+		d
 	}
-	d
 }
 
 #[cfg(test)]

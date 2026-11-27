@@ -177,8 +177,18 @@ fn f16_row(dst: &mut [u8], src: &[f32]) {
 }
 
 impl NpuVision {
-	/// The set in `dir` (`vis.cfg`, `pos.f32`, `vis{0..=layers}.blob`).
+	/// The set in `dir` (`vis.cfg`, `pos.f32`, `vis{0..=layers}.blob`),
+	/// its graphs loaded.
 	pub fn load(npu: &'static Npu, dir: &str) -> Result<NpuVision, String> {
+		let mut v = Self::open(npu, dir)?;
+		v.load_graphs()?;
+		Ok(v)
+	}
+
+	/// [`Self::load`] without the graphs: the first encode loads them (the
+	/// blobs and the driver's copies of the graphs are most of the set's
+	/// memory, held only once an image comes).
+	pub fn open(npu: &'static Npu, dir: &str) -> Result<NpuVision, String> {
 		let d = Path::new(dir);
 		let cfg = VisCfg::parse(&d.join("vis.cfg"))?;
 		let pf = d.join("pos.f32");
@@ -213,7 +223,7 @@ impl NpuVision {
 			b.as_mut_slice().fill(0);
 			job.push(b);
 		}
-		let mut v = NpuVision {
+		let v = NpuVision {
 			cfg,
 			pos_w,
 			npu,
@@ -224,7 +234,12 @@ impl NpuVision {
 			img: None,
 			old: Vec::new(),
 		};
-		v.load_graphs()?;
+		for i in 0..=v.cfg.layers {
+			let f = d.join(format!("vis{i}.blob"));
+			if !f.is_file() {
+				return Err(format!("{}: missing", f.display()));
+			}
+		}
 		Ok(v)
 	}
 

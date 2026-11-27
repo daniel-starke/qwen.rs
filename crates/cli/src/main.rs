@@ -662,8 +662,8 @@ fn main() {
              [--ov-ctx N] [--ov-chunk N] [--ov-prop KEY=VALUE]...\n\
              npu        : {0} <model.npu> --generate|--interactive|--serve [PORT] [--host H] [--prompt-cache-mb N] [--prompt-cache-dir DIR [--prompt-cache-disk-mb N] [--prompt-cache-spill]]\n             \
              [--image <png|jpg|bmp|ppm>]... [--image-max-tokens N]  (with `vision = DIR` in the .npu file)\n\
-             image      : {0} <qwen-image-dir|image.npu> --txt2img PROMPT -o FILE.png [--image FILE]... [--resolution N] [--size WxH] [--seed N] [--steps N] [--noise FILE.f32] [--progress]
-             image server: any --serve above, or {0} <qwen-image-dir|image.npu> --serve [PORT] (images only), with [--image-model DIR|image.npu] [--image-out-dir DIR]... [--image-idle SECS]  (MCP at /mcp, /v1/images/*)
+             image      : {0} <qwen-image-dir|image.npu|h3-image-dir> --txt2img PROMPT -o FILE.png [--image FILE]... [--resolution N] [--size WxH] [--seed N] [--steps N] [--noise FILE.f32] [--image-cache DIR] [--progress]
+             image server: any --serve above, or {0} <qwen-image-dir|image.npu|h3-image-dir> --serve [PORT] (images only), with [--image-model DIR|image.npu] [--image-out-dir DIR]... [--image-idle SECS] [--image-cache DIR]  (MCP at /mcp, /v1/images/*)
              mcp stdio  : {0} --mcp-stdio [URL]  (stdio <-> URL/mcp bridge for clients that only start commands; default http://127.0.0.1:8080)
              npu build  : {0} <bf16-checkpoint-dir> --npu-build OUT [--npu-calib FILE]... [--npu-calib-chunks N] [--npu-steps a,b,..] [--npu-compiler DIR] [--npu-jobs N] [--npu-no-gpu]",
 			args.first().map(|s| s.as_str()).unwrap_or("qwen-rs")
@@ -750,6 +750,7 @@ fn main() {
 		Config::new_long("image-model", Arg::Required),
 		Config::new_long("image-out-dir", Arg::Required),
 		Config::new_long("image-idle", Arg::Required),
+		Config::new_long("image-cache", Arg::Required),
 	];
 
 	let queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
@@ -922,6 +923,7 @@ fn main() {
 				}
 				"mmproj" => mmproj = Some(val.expect("mmproj")),
 				"image-model" => image_model = Some(val.expect("image-model")),
+				"image-cache" => imagegen::wcache::set_dir(val.expect("image-cache").into()),
 				"image-out-dir" => {
 					let d = std::path::PathBuf::from(val.expect("image-out-dir"));
 					let d = std::fs::canonicalize(&d).unwrap_or_else(|e| {
@@ -1135,12 +1137,17 @@ fn main() {
 	};
 
 	// a Qwen-Image checkpoint (or its `image.npu`) as the model path serves images only
-	let image_only = imagegen::Model::is_model(std::path::Path::new(&path));
+	let image_only = imagegen::ImageModel::is_model(std::path::Path::new(&path));
 	if image_only && image_model.is_none() {
 		image_model = Some(path.clone());
 	}
 	if let (Mode::Serve, Some(dir)) = (&mode, &image_model) {
+		let Some(kind) = imagegen::Kind::of(std::path::Path::new(dir)) else {
+			eprintln!("error: --image-model {dir}: not an image model (a Qwen-Image or MiniMax-H3-Image checkpoint, or an image.npu)");
+			exit(2);
+		};
 		server::images::configure(server::images::ImageCfg {
+			kind,
 			dir: dir.into(),
 			out_dirs: image_out.clone(),
 			idle_secs: image_idle,

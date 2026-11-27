@@ -12,6 +12,8 @@ publish.workspace = true
 
 [dependencies]
 gguf = { path = "../gguf" }
+# Already linked through `image` (png -> flate2): inflates `packed!` data.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 
 [lints]
 workspace = true

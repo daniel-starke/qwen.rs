@@ -51,7 +51,7 @@ pub fn table() -> &'static Conflicts {
 	static TABLE: OnceLock<Conflicts> = OnceLock::new();
 	TABLE.get_or_init(|| {
 		let mut pairs: HashMap<(String, String), Vec<(u32, String)>> = HashMap::new();
-		for line in include_str!("conflicts.tbl")
+		for line in quant::packed_str!("conflicts.tbl")
 			.lines()
 			.filter(|l| !l.starts_with('#') && !l.trim().is_empty())
 		{
